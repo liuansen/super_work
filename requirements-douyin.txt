@@ -1,0 +1,10 @@
+# 抖音运营应用（vendor/DouYin_Spider 集成）额外依赖。
+# 主依赖清单 requirements.txt 不变；本文件由抖音集成单独引入。
+# 上游固定版本：cv-cat/DouYin_Spider@d151f9c2980abc304c1ae4918c2272675cd9e4c2
+#
+# 说明：上游还声明 blackboxprotobuf（仅私信会话解析使用）。它与本清单的
+# protobuf>=5.27 存在元数据冲突（blackboxprotobuf 1.0.1 声明 protobuf==3.10.0），
+# 且不在本次整合路径（采集/发布/指标）中，故此处不安装；
+# 如将来整合私信功能，用 `pip install blackboxprotobuf --no-deps` 单独处理。
+curl_cffi>=0.7
+protobuf>=5.27
