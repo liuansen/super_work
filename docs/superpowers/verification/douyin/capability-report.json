@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "source_url": "https://github.com/cv-cat/DouYin_Spider",
+  "source_revision": "d151f9c2980abc304c1ae4918c2272675cd9e4c2",
+  "reviewed_by": "",
+  "accounts_tested": 0,
+  "interaction_metrics": [],
+  "checks": {
+    "license": {
+      "status": "blocked",
+      "observed_at": "2026-11-09T23:15:13+08:00",
+      "authorization_ref": "local-static-review-2026-11-09 (docs/superpowers/verification/douyin/source-review.md，无凭证)",
+      "summary": "无许可证：GitHub API license=null，顶层无 LICENSE/COPYING/NOTICE；README 自述“仅供技术研究与学习使用，请勿用于任何商业用途或非法用途”。默认版权保留，不能确认许可允许本工程运营用途，标记 blocked。",
+      "evidence": [
+        {
+          "path": "evidence/source-license.md",
+          "sha256": "74c1bf9a82f1820e7c810bcc84f2a8b2aaa123c44ba34d967e5646dd600b8889"
+        }
+      ]
+    },
+    "runtime": {
+      "status": "unverified",
+      "observed_at": "2026-11-09T23:15:13+08:00",
+      "authorization_ref": "local-static-review-2026-11-09 (docs/superpowers/verification/douyin/source-review.md，无凭证)",
+      "summary": "仅静态记录：上游声明 Python 3.9+、Node.js 18+ 可选（直播/弹幕加密）、依赖含 curl_cffi/opencv/av/rocksdict 等二进制组件。未安装、未运行，不可声称运行时已验证。",
+      "evidence": [
+        {
+          "path": "evidence/runtime-deps.md",
+          "sha256": "bfbce13e65f220bdcf6089d3f9c3a6acd148a794d18140e5816b9b362b8c9e2b"
+        }
+      ]
+    },
+    "reference_link": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "accounts": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "publish": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "reconcile": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "schedule": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "metrics": {
+      "status": "unverified",
+      "observed_at": "",
+      "authorization_ref": "",
+      "summary": "未验证",
+      "evidence": []
+    },
+    "limits": {
+      "status": "unverified",
+      "observed_at": "2026-11-09T23:15:13+08:00",
+      "authorization_ref": "local-static-review-2026-11-09 (docs/superpowers/verification/douyin/source-review.md，无凭证)",
+      "summary": "仅上游 README 自述限制已记录：完整 cookie 需含 UFIID；写接口需浏览器捕获 DY_DTRAIT_BLOB；create_v2 可能 HTTP 200 但响应体 403；creator msToken 未适配；dtrait/指纹检测持续变化。无确切配额/媒体规格数字，未经真实验证。",
+      "evidence": [
+        {
+          "path": "evidence/known-limits.md",
+          "sha256": "d7aa3c68c49e2e75c5b5eff955e1a991771cff6202050f15a413808949af816c"
+        }
+      ]
+    }
+  }
+}
