@@ -9,11 +9,26 @@ from sqlalchemy.orm import Session
 
 from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
+from backend.app.core.net_guard import public_http_url_error
 from backend.app.core.security import encrypt_text
 from backend.app.models import DEFAULT_TEXT_MODEL_NAME, ModelConfig, User
 from backend.app.schemas.common import paginated
 
 router = APIRouter(prefix="/model-configs", tags=["model-configs"])
+
+
+def _ssrf_guard(base_url: str) -> Optional[str]:
+    """base_url 由用户自由填写，测试连接前确认目标地址合法。
+
+    无条件封禁链路本地（云元数据）/保留段；多租户部署可通过
+    allow_private_model_endpoints=False 同时封禁环回与私网。
+    """
+    from backend.app.core.config import get_settings
+
+    return public_http_url_error(
+        base_url,
+        block_private=not getattr(get_settings(), "allow_private_model_endpoints", True),
+    )
 
 
 class ModelConfigCreateRequest(BaseModel):
@@ -130,6 +145,11 @@ def test_model_config(
 
     api_key = decrypt_text(config.encrypted_api_key)
     base_url = config.base_url.rstrip("/")
+
+    # SSRF 防护：拒绝内网/环回/链路本地地址（用户可任意配置 base_url）
+    guard_message = _ssrf_guard(base_url)
+    if guard_message:
+        return {"id": config.id, "status": "error", "message": guard_message}
 
     try:
         import requests as http_requests

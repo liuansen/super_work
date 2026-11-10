@@ -13,6 +13,7 @@ import {
   Form,
   Input,
   List,
+  Popconfirm,
   Row,
   Select,
   Space,
@@ -382,14 +383,19 @@ export function XhsMonitoringPage() {
                   >
                     手动刷新
                   </Button>
-                  <Button
-                    icon={<DeleteOutlined />}
-                    danger
-                    onClick={() => void removeTarget(target.id)}
+                  <Popconfirm
+                    title="确定删除该监控目标？"
+                    description="快照历史与命中统计将一并删除，且不可恢复。"
+                    okText="删除"
+                    okButtonProps={{ danger: true }}
+                    cancelText="取消"
+                    onConfirm={() => void removeTarget(target.id)}
                     disabled={isWorking}
                   >
-                    删除
-                  </Button>
+                    <Button icon={<DeleteOutlined />} danger disabled={isWorking}>
+                      删除
+                    </Button>
+                  </Popconfirm>
                 </Space>
               </Card>
             </Col>

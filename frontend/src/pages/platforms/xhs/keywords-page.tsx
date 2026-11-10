@@ -14,6 +14,7 @@ import {
   Form,
   Input,
   List,
+  Popconfirm,
   Row,
   Space,
   Spin,
@@ -349,14 +350,19 @@ export function XhsKeywordsPage() {
                     >
                       编辑
                     </Button>
-                    <Button
-                      icon={<DeleteOutlined />}
-                      danger
+                    <Popconfirm
+                      title="确定删除该关键词组？"
+                      description="删除后不可恢复。"
+                      okText="删除"
+                      okButtonProps={{ danger: true }}
+                      cancelText="取消"
+                      onConfirm={() => removeGroup(group.id)}
                       disabled={isWorking}
-                      onClick={() => removeGroup(group.id)}
                     >
-                      删除
-                    </Button>
+                      <Button icon={<DeleteOutlined />} danger disabled={isWorking}>
+                        删除
+                      </Button>
+                    </Popconfirm>
                   </Space>
                 </Card>
               </Col>

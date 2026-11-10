@@ -29,8 +29,15 @@ def _configure_sqlite_connection(dbapi_connection, connection_record) -> None:
         return
 
     cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA journal_mode=MEMORY")
-    cursor.close()
+    try:
+        # WAL：崩溃安全（MEMORY 模式下进程中途被杀会必然损坏数据库文件）
+        cursor.execute("PRAGMA journal_mode=WAL")
+        # 多线程（FastAPI 线程池 + 调度器线程）并发写时等待而不是立刻报 database is locked
+        cursor.execute("PRAGMA busy_timeout=5000")
+        # SQLite 默认不启用外键约束
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
 
 
 def init_db(bind=engine) -> None:
@@ -46,7 +53,11 @@ def _run_alembic_migrations() -> None:
         from alembic import command
         from alembic.config import Config
 
+        import logging
         import os
+        import time
+
+        logger = logging.getLogger(__name__)
 
         ini_path = os.path.join(os.path.dirname(__file__), "..", "..", "alembic.ini")
         ini_path = os.path.normpath(ini_path)
@@ -57,14 +68,41 @@ def _run_alembic_migrations() -> None:
         alembic_cfg = Config(ini_path)
         alembic_cfg.set_main_option("sqlalchemy.url", settings.database_url)
 
-        inspector = inspect(engine)
-        has_tables = bool(inspector.get_table_names())
-        has_alembic = "alembic_version" in inspector.get_table_names()
+        # 多 worker（uvicorn --workers N）并发启动时，避免多个进程同时跑迁移
+        lock_path = os.path.join(os.path.dirname(ini_path), ".alembic-migrate.lock")
+        lock_fd = None
+        try:
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    break
+                except FileExistsError:
+                    if time.monotonic() > deadline:
+                        logger.warning("等待迁移锁超时（%.1fs），继续执行迁移检查", 60.0)
+                        break
+                    time.sleep(0.5)
+            inspector = inspect(engine)
+            has_tables = bool(inspector.get_table_names())
+            has_alembic = "alembic_version" in inspector.get_table_names()
 
-        if has_tables and not has_alembic:
-            command.stamp(alembic_cfg, "head")
-        else:
-            command.upgrade(alembic_cfg, "head")
+            if has_tables and not has_alembic:
+                # 旧版 create_all 建的库：盖戳到 head 意味着假设 schema 与 head 一致，
+                # 若是更老版本升级而来可能缺表，只能靠后续报错暴露。
+                logger.warning(
+                    "检测到无 alembic 版本记录的存量数据库，已 stamp 到 head。"
+                    "如运行时报缺表，请手动执行 alembic stamp <旧版本> && alembic upgrade head。"
+                )
+                command.stamp(alembic_cfg, "head")
+            else:
+                command.upgrade(alembic_cfg, "head")
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+                try:
+                    os.unlink(lock_path)
+                except OSError:
+                    pass
     except ImportError:
         Base.metadata.create_all(bind=engine)
 

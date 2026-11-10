@@ -223,15 +223,25 @@ def generate_x_rap_param(api, data, app_id=None, fingerprint_hex: str = ''):
     """
     import subprocess as _sp
     import json as _json
+    import tempfile
     body = data if isinstance(data, str) else _json.dumps(data or {}, ensure_ascii=False)
-    argv = ['node', _RAP_CLI, api, body]
-    if app_id:
-        argv.append(app_id)
-    elif fingerprint_hex:
-        argv.append('')
-    if fingerprint_hex:
-        argv.append(fingerprint_hex)
+    tmp_path = None
     try:
+        # 长请求体走临时文件（rap_cli 支持 '@<path>'），避免正文进命令行
+        if len(body) > 4096:
+            fd, tmp_path = tempfile.mkstemp(prefix='xhs-rap-', suffix='.json')
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(body)
+            body_arg = f'@{tmp_path}'
+        else:
+            body_arg = body
+        argv = ['node', _RAP_CLI, api, body_arg]
+        if app_id:
+            argv.append(app_id)
+        elif fingerprint_hex:
+            argv.append('')
+        if fingerprint_hex:
+            argv.append(fingerprint_hex)
         r = _sp.run(
             argv, capture_output=True, text=True,
             cwd=os.path.dirname(_RAP_CLI), timeout=30,
@@ -241,6 +251,12 @@ def generate_x_rap_param(api, data, app_id=None, fingerprint_hex: str = ''):
             return out
     except (OSError, _sp.TimeoutExpired):
         pass
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     raise RuntimeError('JS x-rap-param 生成失败')
 
 def get_common_headers():

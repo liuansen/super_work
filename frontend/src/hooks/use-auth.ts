@@ -98,8 +98,13 @@ async function register(credentials: api.AuthCredentials): Promise<void> {
 }
 
 async function logout(): Promise<void> {
-  await api.logout();
-  emit({ status: "anonymous", user: null, error: null });
+  try {
+    await api.logout();
+  } finally {
+    // 即使登出请求网络失败，本地也必须回到未登录态，
+    // 否则 UI 停在“已登录”且后续请求全部 401
+    emit({ status: "anonymous", user: null, error: null });
+  }
 }
 
 export function useAuth() {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Generator, Literal
 
@@ -9,6 +10,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from backend.app.api.platforms.xhs.pc import (
     _get_owned_pc_account_cookies,
@@ -53,7 +56,8 @@ class DataCrawlRequest(BaseModel):
     keyword: str = Field(default="", max_length=120)
     pages: int = Field(default=1, ge=1, le=20)
     max_notes: int = Field(default=20, ge=1, le=200)
-    time_sleep: float = Field(default=0, ge=0, le=60)
+    # 默认 2s 间隔：默认不限流直打平台接口有账号风控风险
+    time_sleep: float = Field(default=2, ge=0, le=60)
     fetch_comments: bool = False
     sort_type_choice: int = Field(default=0, ge=0, le=4)
     note_type: int = Field(default=0, ge=0, le=2)
@@ -475,16 +479,18 @@ def crawl_data(
         except Exception as exc:
             error_occurred = True
             yield _sse_event({"type": "error", "message": str(exc)})
-
-        success_count = len([i for i in items if i["status"] == "success"])
-        failed_count = len(items) - success_count
-        try:
-            if error_occurred:
-                _fail_task(db, task, "partial failure")
-            else:
-                _complete_task(db, task, {"result_count": success_count, "failed_count": failed_count})
-        except Exception:
-            pass
+        finally:
+            # 客户端断开时 GeneratorExit 不是 Exception，不会进上面的 except；
+            # 任务收尾必须放 finally，否则 Task 永久停留在 running
+            success_count = len([i for i in items if i["status"] == "success"])
+            failed_count = len(items) - success_count
+            try:
+                if error_occurred:
+                    _fail_task(db, task, "partial failure")
+                else:
+                    _complete_task(db, task, {"result_count": success_count, "failed_count": failed_count})
+            except Exception as fin_exc:
+                logger.warning(f"Crawl task {getattr(task, 'id', '?')} finalization failed: {fin_exc}")
 
         yield _sse_event({
             "type": "done",

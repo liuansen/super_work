@@ -34,7 +34,7 @@ def test_upgrade_creates_douyin_tables_on_empty_database(tmp_path, monkeypatch):
     # 版本表指向新 revision
     with engine.connect() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "e3f1a9c2b7d4"
+    assert version == "a1b2c3d4e5f6"
     engine.dispose()
 
 

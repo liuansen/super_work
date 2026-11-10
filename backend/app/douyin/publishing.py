@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.app.core.database import SessionLocal
 from backend.app.core.time import shanghai_now
 from backend.app.douyin import accounts as accounts_service
 from backend.app.douyin.contracts import (
@@ -173,17 +175,7 @@ def create_task(
         )
     )
     if existing is not None:
-        existing_digest = _payload_digest(
-            {
-                "account_id": existing.account_id, "kind": existing.kind,
-                "media_names": sorted(json.loads(existing.media_names_json or "[]")),
-                "title": existing.title, "description": existing.description,
-                "visibility": existing.visibility, "allow_download": existing.allow_download,
-                "scheduled_at": existing.scheduled_at.isoformat() if existing.scheduled_at else None,
-            }
-        )
-        if existing_digest != digest:
-            raise PublishConflict("相同幂等键但载荷不同")
+        _verify_idempotent_payload(existing, digest)
         return existing, False
 
     task = DouyinPublishTask(
@@ -200,9 +192,38 @@ def create_task(
         idempotency_key=idempotency_key,
     )
     db.add(task)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # 相同幂等键的并发请求：先查后插双方都没查到，后提交者撞唯一约束。
+        # 回滚后按幂等语义返回已存在的任务，而不是 500。
+        db.rollback()
+        existing = db.scalar(
+            select(DouyinPublishTask).where(
+                DouyinPublishTask.user_id == user_id,
+                DouyinPublishTask.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is None:
+            raise
+        _verify_idempotent_payload(existing, digest)
+        return existing, False
     db.refresh(task)
     return task, True
+
+
+def _verify_idempotent_payload(existing: DouyinPublishTask, digest: str) -> None:
+    existing_digest = _payload_digest(
+        {
+            "account_id": existing.account_id, "kind": existing.kind,
+            "media_names": sorted(json.loads(existing.media_names_json or "[]")),
+            "title": existing.title, "description": existing.description,
+            "visibility": existing.visibility, "allow_download": existing.allow_download,
+            "scheduled_at": existing.scheduled_at.isoformat() if existing.scheduled_at else None,
+        }
+    )
+    if existing_digest != digest:
+        raise PublishConflict("相同幂等键但载荷不同")
 
 
 def _timing_seconds(task: DouyinPublishTask) -> Optional[int]:
@@ -320,3 +341,46 @@ def cancel_task(db: Session, user_id: int, task_id: int) -> DouyinPublishTask:
         f"任务状态为 {task.status}，无法取消"
         + ("（已越过发送边界，平台侧定时/发布不能保证已阻止）" if task.status in (STATUS_RUNNING, STATUS_UNKNOWN, STATUS_SUCCEEDED) else "")
     )
+
+
+STALE_RUNNING_TIMEOUT_MINUTES = 30
+
+
+def reconcile_stale_tasks(*, db: Optional[Session] = None, max_age_minutes: int = STALE_RUNNING_TIMEOUT_MINUTES) -> int:
+    """启动对账：把进程崩溃/重启后滞留在 running 的任务复位为 unknown。
+
+    只复位超过超时阈值的任务，避免误伤其他 worker 正在执行中的任务；
+    结果标记为 unknown（结果不明），与状态机语义一致，绝不自动重发。
+    """
+    own_session = db is None
+    session = db or SessionLocal()
+    try:
+        cutoff = shanghai_now() - timedelta(minutes=max_age_minutes)
+        stale = session.execute(
+            update(DouyinPublishTask)
+            .where(
+                DouyinPublishTask.status == STATUS_RUNNING,
+                or_(
+                    DouyinPublishTask.dispatched_at.is_(None),
+                    DouyinPublishTask.dispatched_at <= cutoff,
+                ),
+            )
+            .values(
+                status=STATUS_UNKNOWN,
+                error_message="执行进程中断，结果不明（启动对账）",
+            )
+        )
+        session.commit()
+        if stale.rowcount:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"启动对账：复位 {stale.rowcount} 个滞留在 running 的抖音发布任务为 unknown"
+            )
+        return stale.rowcount
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        if own_session:
+            session.close()

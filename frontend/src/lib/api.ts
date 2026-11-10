@@ -126,11 +126,21 @@ http.interceptors.request.use((config) => {
   return config;
 });
 
+function isRefreshRequest(config?: { url?: string }): boolean {
+  return Boolean(config?.url && config.url.includes("/auth/refresh"));
+}
+
 http.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config as typeof error.config & { _authRetry?: boolean; _silent?: boolean };
-    if (error.response?.status !== 401 || originalRequest?._authRetry || !getRefreshToken()) {
+    // 关键：refresh 请求自身的 401 绝不能再触发刷新，否则会无限递归请求
+    if (
+      error.response?.status !== 401 ||
+      originalRequest?._authRetry ||
+      isRefreshRequest(originalRequest) ||
+      !getRefreshToken()
+    ) {
       if (!originalRequest?._silent) {
         const detail = error.response?.data?.detail;
         const msg = typeof detail === "string" ? detail : "请求失败，请稍后重试";
@@ -162,17 +172,33 @@ export async function register(credentials: AuthCredentials): Promise<AuthPayloa
   return persistAuthPayload(response.data);
 }
 
+/** 进行中的刷新请求：并发 401 共用同一次刷新，避免重复请求风暴 */
+let refreshInFlight: Promise<string> | null = null;
+
 export async function refreshAccessToken(): Promise<string> {
   const refreshToken = getRefreshToken();
   if (!refreshToken) {
     throw new Error("Missing refresh token");
   }
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
 
-  const response = await http.post<{ access_token: string; token_type: "bearer" }>("/auth/refresh", {
-    refresh_token: refreshToken
-  });
-  setAccessToken(response.data.access_token);
-  return response.data.access_token;
+  const request = (async () => {
+    try {
+      const response = await http.post<{ access_token: string; token_type: "bearer" }>(
+        "/auth/refresh",
+        { refresh_token: refreshToken },
+        { _silent: true } as never
+      );
+      setAccessToken(response.data.access_token);
+      return response.data.access_token;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+  refreshInFlight = request;
+  return request;
 }
 
 export async function fetchMe(): Promise<PlatformUser> {
@@ -182,12 +208,24 @@ export async function fetchMe(): Promise<PlatformUser> {
 
 export async function bootstrapAuth(): Promise<PlatformUser | null> {
   if (!getAccessToken() && hasRefreshToken()) {
-    await refreshAccessToken();
+    try {
+      await refreshAccessToken();
+    } catch {
+      // refresh token 已失效（如超过 7 天）：清理本地凭证并回到登录页，
+      // 不能把异常抛给上层导致应用卡在“正在验证登录状态”
+      clearAuthTokens();
+      return null;
+    }
   }
   if (!getAccessToken()) {
     return null;
   }
-  return fetchMe();
+  try {
+    return await fetchMe();
+  } catch {
+    clearAuthTokens();
+    return null;
+  }
 }
 
 export async function logout(): Promise<void> {
@@ -259,6 +297,7 @@ export type SavedNoteFilters = {
   tag_id?: number;
   has_assets?: boolean;
   has_comments?: boolean;
+  page?: number;
   page_size?: number;
 };
 
@@ -277,6 +316,7 @@ export async function fetchSavedNotes(platformOrFilters: string | SavedNoteFilte
           tag_id: platformOrFilters.tag_id,
           has_assets: platformOrFilters.has_assets,
           has_comments: platformOrFilters.has_comments,
+          page: platformOrFilters.page,
           page_size: platformOrFilters.page_size,
         };
   const response = await http.get<Paginated<SavedNote>>("/notes", { params });
@@ -396,13 +436,26 @@ export async function crawlXhsDataStream(
   onItem: (index: number, item: XhsDataCrawlItem) => void,
   onProgress?: (message: string) => void,
   onError?: (message: string) => void,
+  signal?: AbortSignal,
 ): Promise<{ total: number; success_count: number; failed_count: number }> {
-  const token = getAccessToken();
-  const response = await fetch("/api/xhs/crawl/data", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-    body: JSON.stringify(payload),
-  });
+  // 支持 AbortSignal 取消；401 时先刷新一次 token 再重试（原生 fetch 不经过 axios 拦截器）
+  const doFetch = async (token: string | null) =>
+    fetch("/api/xhs/crawl/data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+  let response = await doFetch(getAccessToken());
+  if (response.status === 401 && getRefreshToken()) {
+    try {
+      const token = await refreshAccessToken();
+      response = await doFetch(token);
+    } catch {
+      /* 刷新失败则按原 401 处理 */
+    }
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail || `HTTP ${response.status}`);

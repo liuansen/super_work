@@ -62,11 +62,15 @@ export type PlatformAccount = {
 
 export type XhsQrLoginSession = {
   session_id: number;
-  status: "pending" | "scanned" | "confirmed" | "expired" | string;
+  status: "pending" | "scanned" | "confirmed" | "expired" | "blocked" | string;
   qr_url: string;
   qr_image_data_url?: string;
   account?: PlatformAccount | null;
   creator_account?: PlatformAccount | null;
+  message?: string;
+  error_code?: string;
+  upstream_status?: number;
+  retryable?: boolean;
 };
 
 export type XhsSearchNote = {

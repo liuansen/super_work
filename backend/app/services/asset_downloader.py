@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from loguru import logger
@@ -8,8 +9,24 @@ from loguru import logger
 from backend.app.core.config import get_settings
 
 
+def _host_allowed(url: str) -> bool:
+    """仅允许平台 CDN 白名单域名（后缀匹配），防服务端任意 GET。"""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    raw = getattr(get_settings(), "media_url_allowed_hosts", "") or ""
+    suffixes = [s.strip().lower() for s in raw.split(",") if s.strip()]
+    return any(host == s or host.endswith("." + s) for s in suffixes)
+
+
 def download_asset_to_local(url: str, user_id: int, asset_type: str) -> str | None:
     if not url or not url.startswith(("http://", "https://")):
+        return None
+    if not _host_allowed(url):
+        logger.warning(f"Asset download rejected (host not allowlisted): {url[:80]}")
         return None
     try:
         import requests

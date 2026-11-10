@@ -3,8 +3,10 @@ import main
 
 def test_parse_args_defaults_to_backend_only():
     args = main.parse_args([])
-    assert args.host == "127.0.0.1"
-    assert args.port == 8000
+    # host/port 默认 None：未显式传参时才回落到配置值，
+    # 这样显式 --host 127.0.0.1 不会被 server_host 覆盖
+    assert args.host is None
+    assert args.port is None
     assert args.with_frontend is False
 
 

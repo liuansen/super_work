@@ -31,7 +31,7 @@ import {
 } from "antd";
 import dayjs from "dayjs";
 import type { Dayjs } from "dayjs";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { PageHeader } from "../../../components/layout/app-shell";
 import {
@@ -63,14 +63,23 @@ function getStatusTag(status: string) {
   return <Tag color={mapping.color}>{mapping.label}</Tag>;
 }
 
+// 定时发布统一按北京时间（UTC+8）解释：用户所见墙钟即所提交时间，
+// 不经过浏览器本地时区换算（任何时区的用户行为一致）。
 function toLocalInputValue(value?: string | null): string {
   if (!value) return "";
+  // 后端返回无时区北京时间，直接取墙钟展示
   return value.replace("T", " ").slice(0, 16).replace(" ", "T");
+}
+
+function toBeijingIso(value: string): string {
+  // "YYYY-MM-DDTHH:mm" → 带 +08:00 偏移的 ISO（补秒）
+  return `${value.length === 16 ? `${value}:00` : value}+08:00`;
 }
 
 function isFutureScheduledAt(value: string): boolean {
   if (!value) return false;
-  const timestamp = new Date(value).getTime();
+  // 按北京时间解析，避免非 UTC+8 浏览器把墙钟当本地时间导致校验口径不一致
+  const timestamp = new Date(toBeijingIso(value)).getTime();
   return Number.isFinite(timestamp) && timestamp > Date.now();
 }
 
@@ -181,16 +190,27 @@ export function XhsPublishPage() {
     }
   }
 
+  // 快速连续点击任务时，用序号守卫丢弃过期的响应，避免旧任务的
+  // 详情/素材覆盖后来选中任务
+  const selectRequestSeq = useRef(0);
+
   async function handleSelect(job: PublishJob) {
+    const seq = ++selectRequestSeq.current;
     setIsDetailLoading(true);
     try {
       const detail = await fetchPublishJob(job.id);
+      if (seq !== selectRequestSeq.current) return;
       applyJob(detail);
       await loadAssets(detail.id);
+      if (seq !== selectRequestSeq.current) return;
     } catch {
-      setError("发布任务详情加载失败。");
+      if (seq === selectRequestSeq.current) {
+        setError("发布任务详情加载失败。");
+      }
     } finally {
-      setIsDetailLoading(false);
+      if (seq === selectRequestSeq.current) {
+        setIsDetailLoading(false);
+      }
     }
   }
 
@@ -203,7 +223,7 @@ export function XhsPublishPage() {
       const updated = await updatePublishJob(selectedJob.id, {
         platform_account_id: selectedAccountId,
         publish_mode: publishMode,
-        scheduled_at: publishMode === "scheduled" && scheduledAt ? scheduledAt.replace("T", " ") : null,
+        scheduled_at: publishMode === "scheduled" && scheduledAt ? toBeijingIso(scheduledAt) : null,
         topics: parseTopics(topicsText),
         location: location.trim() || null,
         is_private: privacyChoice === "private",
@@ -227,7 +247,7 @@ export function XhsPublishPage() {
       await updatePublishJob(selectedJob.id, {
         platform_account_id: selectedAccountId,
         publish_mode: publishMode,
-        scheduled_at: publishMode === "scheduled" && scheduledAt ? scheduledAt.replace("T", " ") : null,
+        scheduled_at: publishMode === "scheduled" && scheduledAt ? toBeijingIso(scheduledAt) : null,
         topics: parseTopics(topicsText),
         location: location.trim() || null,
         is_private: privacyChoice === "private",

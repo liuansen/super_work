@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from typing import Any, Mapping, Optional
 
 
@@ -65,6 +66,26 @@ def generate_b1(
     return value
 
 
+def _payload_via_temp_file(payload_json: str, prefix: str = 'xhs-sign-'):
+    """把载荷写入临时文件，返回 '@<path>' 形式的 CLI 参数。
+
+    payload 含完整 Cookie 与请求体：直接放 argv 会泄露到进程列表
+    （Linux /proc/<pid>/cmdline 全局可读），且 Windows 命令行有 32767
+    字符上限，长 Cookie/大 body 会直接失败。sign.js 支持 '@path' 语法。
+    """
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix='.json')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(payload_json)
+        return f'@{path}', path
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
 def run_signer(
     api: str,
     data: Any = '',
@@ -106,8 +127,14 @@ def run_signer(
             payload[key] = context[key]
 
     try:
+        arg, tmp_path = _payload_via_temp_file(
+            json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+        )
+    except OSError:
+        return None
+    try:
         proc = subprocess.run(
-            ['node', _SIGN_JS, json.dumps(payload, ensure_ascii=False)],
+            ['node', _SIGN_JS, arg],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -117,6 +144,11 @@ def run_signer(
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
     if proc.returncode != 0:
         return None
 

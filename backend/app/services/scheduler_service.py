@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
 from backend.app.core.database import SessionLocal
 from backend.app.core.security import decrypt_text
-from backend.app.core.time import shanghai_now
+from backend.app.core.time import shanghai_now, to_naive_shanghai
 from backend.app.models import (
     AccountCookieVersion,
     AiDraft,
@@ -117,12 +117,27 @@ def _apply_publish_options(note_info: dict[str, Any], options: dict[str, Any]) -
         note_info["type"] = options["privacy_type"]
 
 
-def _run_one_due_publish_job(db: Session, current_user: User, job: PublishJob, adapter_factory) -> tuple[bool, dict[str, Any]]:
-    account = db.get(PlatformAccount, job.platform_account_id)
-    if account is None or account.user_id != current_user.id:
-        raise RuntimeError("Account not found")
-    if account.platform != "xhs" or account.sub_type != "creator":
-        raise RuntimeError("Creator account required")
+def _claim_publish_job(db: Session, job_id: int) -> bool:
+    """原子领取：仅当任务仍为 pending 时置为 publishing（条件 UPDATE）。
+
+    调度器、手动发布接口、/tasks/run-due 三方并发时，只有一个能领取成功，
+    杜绝对同一笔记重复发布。
+    """
+    claimed = db.execute(
+        update(PublishJob)
+        .where(PublishJob.id == job_id, PublishJob.status == "pending")
+        .values(status="publishing", publish_error="", publish_started_at=shanghai_now())
+    )
+    db.commit()
+    return claimed.rowcount == 1
+
+
+def _run_one_due_publish_job(db: Session, current_user: User, job: PublishJob, adapter_factory) -> tuple[str, dict[str, Any]]:
+    """领取并执行一个到期任务。返回 (outcome, serialized)；outcome ∈ published/failed/skipped。"""
+    if not _claim_publish_job(db, job.id):
+        db.refresh(job)
+        return "skipped", _serialize_publish_job(job)
+    db.refresh(job)
 
     task = Task(
         user_id=current_user.id,
@@ -130,14 +145,18 @@ def _run_one_due_publish_job(db: Session, current_user: User, job: PublishJob, a
         task_type="creator_publish_scheduler",
         status="running",
         progress=20,
-        payload={"publish_job_id": job.id, "platform_account_id": account.id, "scheduled_at": job.scheduled_at.isoformat() if job.scheduled_at else None},
+        payload={"publish_job_id": job.id, "platform_account_id": job.platform_account_id, "scheduled_at": job.scheduled_at.isoformat() if job.scheduled_at else None},
     )
     db.add(task)
-    job.status = "publishing"
-    job.publish_error = ""
     db.commit()
 
     try:
+        account = db.get(PlatformAccount, job.platform_account_id)
+        if account is None or account.user_id != current_user.id:
+            raise RuntimeError("Account not found")
+        if account.platform != "xhs" or account.sub_type != "creator":
+            raise RuntimeError("Creator account required")
+
         assets = db.scalars(
             select(PublishAsset).where(PublishAsset.publish_job_id == job.id).order_by(PublishAsset.id.asc())
         ).all()
@@ -166,16 +185,20 @@ def _run_one_due_publish_job(db: Session, current_user: User, job: PublishJob, a
         task.payload = {**(task.payload or {}), "external_note_id": job.external_note_id, "published_at": job.published_at.isoformat()}
         db.commit()
         db.refresh(job)
-        return True, _serialize_publish_job(job)
+        return "published", _serialize_publish_job(job)
     except Exception as exc:
+        db.rollback()
+        job = db.get(PublishJob, job.id)
+        task = db.get(Task, task.id)
         job.status = "failed"
         job.publish_error = str(exc)
-        task.status = "failed"
-        task.progress = 100
-        task.payload = {**(task.payload or {}), "error": str(exc)}
+        if task is not None:
+            task.status = "failed"
+            task.progress = 100
+            task.payload = {**(task.payload or {}), "error": str(exc)}
         db.commit()
         db.refresh(job)
-        return False, _serialize_publish_job(job)
+        return "failed", _serialize_publish_job(job)
 
 
 def run_due_publish_jobs(
@@ -202,16 +225,36 @@ def run_due_publish_jobs(
     ).all()
 
     items: list[dict[str, Any]] = []
+    skipped_count = 0
     failed_count = 0
     for job in due_jobs:
-        succeeded, item = _run_one_due_publish_job(db, current_user, job, adapter_factory)
+        try:
+            outcome, item = _run_one_due_publish_job(db, current_user, job, adapter_factory)
+        except Exception as exc:
+            db.rollback()
+            logger.exception(f"Due publish job {job.id} crashed: {exc}")
+            try:
+                stale = db.get(PublishJob, job.id)
+                if stale is not None and stale.status in ("pending", "publishing"):
+                    stale.status = "failed"
+                    stale.publish_error = f"调度器内部错误: {exc}"[:500]
+                db.commit()
+                item = _serialize_publish_job(db.get(PublishJob, job.id))
+            except Exception:
+                db.rollback()
+                continue
+            outcome = "failed"
+        if outcome == "skipped":
+            skipped_count += 1
+            continue
         items.append(item)
-        if not succeeded:
+        if outcome == "failed":
             failed_count += 1
 
     return {
         "executed_count": len(items),
         "failed_count": failed_count,
+        "skipped_count": skipped_count,
         "items": items,
     }
 
@@ -270,6 +313,46 @@ def run_due_publish_jobs_once(platform: str = "xhs", adapter_factory=XhsCreatorA
         )
     finally:
         db.close()
+
+
+STALE_PUBLISH_TIMEOUT_MINUTES = 30
+
+
+def reconcile_stale_publish_jobs(*, db: Optional[Session] = None) -> dict[str, Any]:
+    """启动对账：把进程崩溃/重启时滞留在 publishing/uploading 的任务复位为 failed。
+
+    只复位超过超时阈值的任务（正常上传+发布最多几分钟），避免误伤
+    其他 worker 正在执行中的任务；publish_started_at 为 NULL 的视为
+    历史遗留（旧数据），同样复位。
+    """
+    own_session = db is None
+    session = db or SessionLocal()
+    try:
+        now = shanghai_now()
+        cutoff = now - timedelta(minutes=STALE_PUBLISH_TIMEOUT_MINUTES)
+        stale_jobs = session.scalars(
+            select(PublishJob).where(
+                PublishJob.status.in_(("publishing", "uploading")),
+                or_(
+                    PublishJob.publish_started_at.is_(None),
+                    PublishJob.publish_started_at <= cutoff,
+                ),
+            )
+        ).all()
+        for job in stale_jobs:
+            job.status = "failed"
+            job.publish_error = "任务执行被进程重启中断，请重试"
+        if stale_jobs:
+            session.commit()
+            logger.warning(f"启动对账：复位 {len(stale_jobs)} 个滞留的发布任务")
+        return {"reset_publish_jobs": len(stale_jobs)}
+    except Exception as exc:
+        session.rollback()
+        logger.error(f"reconcile_stale_publish_jobs failed: {exc}")
+        return {"reset_publish_jobs": 0, "error": str(exc)}
+    finally:
+        if own_session:
+            session.close()
 
 
 def _as_int(value: Any) -> int:
@@ -393,8 +476,22 @@ def run_monitoring_refresh_for_all_users(*, db: Session, now: Optional[datetime]
         .order_by(MonitoringTarget.id.asc())
     ).all()
 
-    items = [_refresh_monitoring_target(db, target, now, platform) for target in targets]
-    db.commit()
+    items = []
+    for target in targets:
+        # 尊重每个 target 自己的抓取间隔，而不是每个调度 tick 全量刷新
+        interval_minutes = target.crawl_interval_minutes or 60
+        if target.last_refreshed_at is not None:
+            due_at = target.last_refreshed_at + timedelta(minutes=interval_minutes)
+            if now < due_at:
+                continue
+        try:
+            item = _refresh_monitoring_target(db, target, now, platform)
+            db.commit()
+            items.append(item)
+        except Exception as exc:
+            db.rollback()
+            logger.warning(f"Monitoring refresh failed for target {target.id}: {exc}")
+
     return {
         "refreshed_count": len(items),
         "items": items,
@@ -487,7 +584,7 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
     db.add(draft)
     db.flush()
 
-    # Try AI rewrite title + body (non-fatal)
+    # Try AI rewrite title + body (non-fatal, but never silent)
     try:
         model_config, api_key = _get_text_model_for_user(db, task.user_id)
         if model_config:
@@ -511,10 +608,14 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
                 )
                 if titles:
                     draft.title = titles[0]
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logger.warning(f"Auto task {task.id} title generation failed: {exc}")
+        else:
+            logger.warning(
+                f"Auto task {task.id} 未配置可用的文本模型，将以原文发布（存在搬运风险）"
+            )
+    except Exception as exc:
+        logger.warning(f"Auto task {task.id} AI rewrite failed,将以原文发布: {exc}")
 
     # Get Creator cookies
     creator_account = db.get(PlatformAccount, task.creator_account_id)
@@ -557,6 +658,7 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
         body=draft.body,
         publish_mode="immediate",
         status="publishing",
+        publish_started_at=shanghai_now(),
     )
     db.add(job)
     db.flush()
@@ -567,8 +669,8 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
             asset_type="image",
             file_path="",
             upload_status="uploaded",
-            creator_media_id=info.get("fileIds", ""),
-            creator_upload_info=json.dumps(info, ensure_ascii=False),
+            creator_media_id=str(info.get("fileIds", "") or ""),
+            creator_upload_info=json.dumps(info, ensure_ascii=False, default=str),
         ))
     db.flush()
 
@@ -596,7 +698,8 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
         job.publish_error = str(exc)[:500]
         logger.warning(f"Auto task {task.id} publish failed: {exc}")
 
-    task.total_published = (task.total_published or 0) + 1
+    if job.status == "published":
+        task.total_published = (task.total_published or 0) + 1
     task.last_run_at = shanghai_now()
     logger.info(f"Auto task {task.id} executed: keyword={keyword}, job={job.id}, status={job.status}")
 
@@ -617,16 +720,23 @@ def run_due_auto_tasks() -> None:
         ).all()
 
         for task in due_tasks:
+            # 每个任务独立事务：远端发布成功后立即提交，
+            # 避免整批共用一次 commit 导致“已发布但回滚→下个 tick 重复发布”。
             try:
                 _execute_auto_task_background(db, task)
+                db.commit()
             except Exception as exc:
+                db.rollback()
                 logger.warning(f"Auto task {task.id} execution failed: {exc}")
-            finally:
-                # Always calculate next run
+            try:
+                db.refresh(task)
                 _calculate_next_run_at(task)
-
-        db.commit()
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                logger.warning(f"Auto task {task.id} next-run reschedule failed: {exc}")
     except Exception as exc:
+        db.rollback()
         logger.error(f"run_due_auto_tasks failed: {exc}")
     finally:
         db.close()
@@ -644,10 +754,12 @@ def _check_single_account(db: Session, account: PlatformAccount, now: datetime) 
         .order_by(AccountCookieVersion.created_at.desc())
     ).first()
     if cookie_version is None:
+        old_status = account.status
         account.status = "expired"
         account.status_message = "No stored cookie version"
         account.updated_at = now
-        return "expired"
+        # 返回旧状态，调用方据此判断是否需要发“新过期”通知
+        return old_status
 
     adapter = XhsCreatorLoginAdapter() if account.sub_type == "creator" else XhsPcLoginAdapter()
     try:
@@ -707,15 +819,18 @@ def build_due_publish_scheduler(interval_seconds: int, job_func, monitoring_job_
         max_instances=1,
         coalesce=True,
     )
-    scheduler.add_job(
-        monitoring_job_func or job_func,
-        "interval",
-        seconds=interval_seconds,
-        id="monitoring_refresh_runner",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
+    # max_instances=1 只对同一 job id 生效；未传监控函数时不得把发布函数
+    # 再注册成第二个 id，否则两条 job 会并发执行同一逻辑。
+    if monitoring_job_func is not None:
+        scheduler.add_job(
+            monitoring_job_func,
+            "interval",
+            seconds=interval_seconds,
+            id="monitoring_refresh_runner",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
     scheduler.add_job(
         run_due_auto_tasks,
         "interval",

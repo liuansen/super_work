@@ -192,6 +192,15 @@ function SortableRewriteImage({ asset, onEdit, onRemove, onView }: { asset: Draf
   );
 }
 
+// 本地临时素材 id：负数表示“仅本地、尚未入库”。
+// 用单调递减计数器而非 -Date.now()，避免同一毫秒内多个文件拿到相同 id
+// 导致 React key / dnd-kit item id 冲突。
+let localAssetSeq = 0;
+function nextLocalAssetId(): number {
+  localAssetSeq += 1;
+  return -localAssetSeq;
+}
+
 export function XhsDraftsPage() {
   const [activeMode, setActiveMode] = useState<AiContentMode>("rewrite");
   const [drafts, setDrafts] = useState<Draft[]>([]);
@@ -231,6 +240,7 @@ export function XhsDraftsPage() {
   const [userImages, setUserImages] = useState<UserImageFile[]>([]);
   const [aiAssets, setAiAssets] = useState<GeneratedImageAsset[]>([]);
   const [selectedAssetUrls, setSelectedAssetUrls] = useState<string[]>([]);
+  const [isAddingAssets, setIsAddingAssets] = useState(false);
   const [refPickerOpen, setRefPickerOpen] = useState(false);
   const [refPickerUrlInput, setRefPickerUrlInput] = useState("");
 
@@ -244,21 +254,26 @@ export function XhsDraftsPage() {
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     if (!over || active.id === over.id) return;
-    setSourceAssets((prev) => {
-      const images = prev.filter((a) => a.asset_type === "image");
-      const others = prev.filter((a) => a.asset_type !== "image");
-      const oldIdx = images.findIndex((a) => a.id === Number(active.id));
-      const newIdx = images.findIndex((a) => a.id === Number(over.id));
-      if (oldIdx < 0 || newIdx < 0) return prev;
-      const reorderedImages = arrayMove(images, oldIdx, newIdx);
-      const result = [...reorderedImages, ...others];
-      const draftId = selectedDraft?.id;
-      if (draftId) {
-        const ids = reorderedImages.filter((a) => a.id > 0).map((a) => a.id);
-        void reorderDraftAssets(draftId, ids).catch((err) => { console.error("reorder failed", err); });
+    // setState updater 必须是纯函数（StrictMode 会双调用）；
+    // 先基于当前状态算出新顺序，再在 updater 外发起 API 请求
+    const images = sourceAssets.filter((a) => a.asset_type === "image");
+    const others = sourceAssets.filter((a) => a.asset_type !== "image");
+    const oldIdx = images.findIndex((a) => a.id === Number(active.id));
+    const newIdx = images.findIndex((a) => a.id === Number(over.id));
+    if (oldIdx < 0 || newIdx < 0) return;
+    const reorderedImages = arrayMove(images, oldIdx, newIdx);
+    const result = [...reorderedImages, ...others];
+    setSourceAssets(result);
+    const draftId = selectedDraft?.id;
+    if (draftId) {
+      const ids = reorderedImages.filter((a) => a.id > 0).map((a) => a.id);
+      if (ids.length) {
+        void reorderDraftAssets(draftId, ids).catch((err) => {
+          console.error("reorder failed", err);
+          antMessage.warning("图片顺序同步失败，请刷新后重试");
+        });
       }
-      return result;
-    });
+    }
   }
 
   function handleRemoveAsset(assetId: number) {
@@ -283,7 +298,7 @@ export function XhsDraftsPage() {
           setSourceAssets((prev) => [...prev, saved]);
         } else {
           setSourceAssets((prev) => [...prev, {
-            id: -(Date.now()),
+            id: nextLocalAssetId(),
             draft_id: 0,
             asset_type: uploaded.asset_type,
             url: uploaded.download_url,
@@ -316,7 +331,7 @@ export function XhsDraftsPage() {
       })();
     } else {
       setSourceAssets((prev) => [...prev, {
-        id: -(Date.now()),
+        id: nextLocalAssetId(),
         draft_id: 0,
         asset_type: assetType,
         url: trimmed,
@@ -334,27 +349,42 @@ export function XhsDraftsPage() {
 
   function handleAddSelectedAssets() {
     const draftId = selectedDraft?.id;
+    if (isAddingAssets) return; // 防重入：双击会导致同一批图片被重复添加
+    const urls = [...selectedAssetUrls];
+    if (!urls.length) return;
+    setIsAddingAssets(true);
     (async () => {
-      for (const url of selectedAssetUrls) {
+      let added = 0;
+      let failed = 0;
+      for (const url of urls) {
         if (draftId) {
           try {
             const saved = await addDraftAsset(draftId, { asset_type: "image", url });
             setSourceAssets(prev => [...prev, saved]);
-          } catch { /* ignore individual failures */ }
+            added += 1;
+          } catch {
+            failed += 1;
+          }
         } else {
           setSourceAssets(prev => [...prev, {
-            id: -(Date.now() + Math.random()),
+            id: nextLocalAssetId(),
             draft_id: 0,
             asset_type: "image",
             url,
             local_path: "",
             sort_order: prev.length,
           }]);
+          added += 1;
         }
       }
       setSelectedAssetUrls([]);
       setUploadModalOpen(false);
-      antMessage.success(`已添加 ${selectedAssetUrls.length} 个图片`);
+      if (failed) {
+        antMessage.warning(`已添加 ${added} 个图片，${failed} 个失败`);
+      } else {
+        antMessage.success(`已添加 ${added} 个图片`);
+      }
+      setIsAddingAssets(false);
     })();
   }
 
@@ -1282,7 +1312,7 @@ export function XhsDraftsPage() {
           ]} />
 
           {selectedAssetUrls.length > 0 && (
-            <Button type="primary" block style={{ marginTop: 12 }} onClick={handleAddSelectedAssets}>
+            <Button type="primary" block style={{ marginTop: 12 }} onClick={handleAddSelectedAssets} loading={isAddingAssets}>
               添加选中的 {selectedAssetUrls.length} 个图片
             </Button>
           )}

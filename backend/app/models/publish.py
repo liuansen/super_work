@@ -24,6 +24,8 @@ class PublishJob(Base):
     publish_options: Mapped[str] = mapped_column(Text, default="{}")
     status: Mapped[str] = mapped_column(String(32), default="pending")
     scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # 领取（置为 publishing/uploading）的时间，用于启动对账识别僵尸任务
+    publish_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     external_note_id: Mapped[str] = mapped_column(String(128), default="")
     publish_error: Mapped[str] = mapped_column(Text, default="")
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

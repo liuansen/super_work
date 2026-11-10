@@ -1,12 +1,15 @@
 import random
 import re
 import time
+from copy import deepcopy
+from dataclasses import asdict
 
 from loguru import logger
 
 from xhs_utils.http_util import REQUEST_TIMEOUT
 from xhs_utils.xhs_core.auth import PC_PLATFORM_CONFIG
 from xhs_utils.xhs_core.cookies import HostCookieStore
+from xhs_utils.xhs_core.errors import XhsLoginBlockedError
 from xhs_utils.xhs_pc.dsl import get_dsl
 from xhs_utils.xhs_pc.http import PcHttpClient
 from xhs_utils.xhs_pc.params import (
@@ -20,7 +23,9 @@ from xhs_utils.xhs_pc.params import (
 )
 from xhs_utils.xhs_pc.runtime import generate_profile_data, generate_websectiga
 from xhs_utils.xhs_pc.state import (
+    B1RuntimeState,
     PcDeviceProfile,
+    PcSessionState,
     REFERENCE_PROFILE,
     cookie_header,
     initial_pc_cookies,
@@ -29,6 +34,61 @@ from xhs_utils.common_util import generate_a1, generate_web_id
 
 
 _GETDSS_RE = re.compile(r"function\s+getdss\s*\(\s*\)\s*\{\s*return\s+'(\d+)'")
+
+
+def _response_integer(value):
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().isdecimal() and len(value.strip()) <= 10:
+        return int(value.strip())
+    return None
+
+
+def _qr_status(data):
+    if not isinstance(data, dict):
+        return None
+    for key in ('code_status', 'codeStatus'):
+        value = _response_integer(data.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _qr_request_succeeded(payload):
+    # Some responses only carry code=0; an explicit success=False still wins.
+    if 'success' in payload:
+        return payload['success'] is True
+    return _response_integer(payload.get('code')) == 0
+
+
+def _qr_response_error(operation, response, payload):
+    # Report only status metadata: response bodies can contain login credentials.
+    success = payload.get('success')
+    success_label = {True: 'true', False: 'false'}.get(success) if isinstance(success, bool) else None
+    success_label = success_label or ('missing' if 'success' not in payload else 'invalid')
+    code = _response_integer(payload.get('code'))
+    state = _qr_status(payload.get('data'))
+    http_status = getattr(response, 'status_code', 'unknown')
+    return RuntimeError(
+        f'{operation}未完成（HTTP {http_status}, success={success_label}, '
+        f'code={code if code is not None else "missing/invalid"}, '
+        f'code_status={state if state is not None else "missing/invalid"}）'
+    )
+
+
+def _read_qr_response(operation, response):
+    # A gateway rejection is authoritative even when its body says code=0.
+    if response.status_code == 471:
+        raise XhsLoginBlockedError(operation)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f'{operation}响应不是 JSON（HTTP {response.status_code}）') from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f'{operation}响应格式无效（预期 JSON 对象）')
+    if not response.ok or not _qr_request_succeeded(payload):
+        raise _qr_response_error(operation, response, payload)
+    return payload
 
 
 class XHSLoginApi:
@@ -85,6 +145,58 @@ class XHSLoginApi:
 
     def close(self):
         self.http.close()
+
+    def export_login_state(self):
+        """Checkpoint an ongoing login. Contains secrets; persist encrypted only."""
+        profile = self.profile
+        options = {
+            name: deepcopy(getattr(self, name)) for name in (
+                'fixed_b1', 'dsl', 'local_storage', 'session_storage', 'web_build',
+                'mns_env', 'rap_fingerprint_hex', 'web_profile_fields',
+                'web_profile_i12_seed', 'web_profile_fi',
+            )
+        }
+        return {
+            'version': 1,
+            'options': options,
+            'host_cookies': self.host_cookie_state(),
+            'profile_data': self.profile_data,
+            'webprofile_reported': self._webprofile_reported,
+            'login_b1': self._login_b1,
+            'session': asdict(profile.session) if profile else None,
+            'b1_state': asdict(profile.b1_state) if profile and profile.b1_state else None,
+            'named_b1_states': {
+                key: asdict(value) for key, value in profile._named_b1_states.items()
+            } if profile else {},
+            'named_b1_values': dict(profile._named_b1_values) if profile else {},
+        }
+
+    def restore_login_state(self, cookies, state):
+        """Restore only explicit data fields, never an HTTP client or executable."""
+        if not isinstance(state, dict) or state.get('version') != 1:
+            raise ValueError('登录会话状态版本不兼容，请重新生成二维码')
+        options = state.get('options') or {}
+        for name in (
+            'fixed_b1', 'dsl', 'local_storage', 'session_storage', 'web_build',
+            'mns_env', 'rap_fingerprint_hex', 'web_profile_fields',
+            'web_profile_i12_seed', 'web_profile_fi',
+        ):
+            if name in options:
+                setattr(self, name, deepcopy(options[name]))
+        self._cookie_store = HostCookieStore.from_state(state.get('host_cookies'))
+        b1_state = state.get('b1_state')
+        self.b1_state = B1RuntimeState(**b1_state) if b1_state else None
+        self.profile = self._new_profile(cookies)
+        if state.get('session') is not None:
+            self.profile.session = PcSessionState(**state['session'])
+        self.profile._named_b1_states = {
+            key: B1RuntimeState(**value)
+            for key, value in (state.get('named_b1_states') or {}).items()
+        }
+        self.profile._named_b1_values = dict(state.get('named_b1_values') or {})
+        self.profile_data = str(state.get('profile_data') or '')
+        self._webprofile_reported = bool(state.get('webprofile_reported'))
+        self._login_b1 = str(state.get('login_b1') or '')
 
     def _new_profile(self, cookies):
         profile = PcDeviceProfile(
@@ -584,10 +696,10 @@ class XHSLoginApi:
         )
         self._merge_response_cookies(cookies, resp)
 
-        res = resp.json()
-        status = (res.get('data') or {}).get('codeStatus')
-        if status is None:
-            return False, res.get('msg', '二维码状态响应缺少 codeStatus'), cookies
+        res = _read_qr_response('二维码状态查询', resp)
+        status = _qr_status(res.get('data'))
+        if status not in (0, 1, 2, 3):
+            raise _qr_response_error('二维码状态解析', resp, res)
 
         if status == 2:
             cookies = self._login_by_qrcode_status(qr_id, code, cookies)
@@ -631,21 +743,27 @@ class XHSLoginApi:
             ),
         )
 
-        res = resp.json()
-        data = res.get('data') or {}
-        if not res.get('success') or data.get('code_status') != 2:
-            raise RuntimeError(res.get('msg') or '二维码最终登录状态无效')
-        login_info = data.get('login_info') or {}
-        session = str(login_info.get('session') or '')
-        if session:
-            # Replace the anonymous session even when Set-Cookie parsing is
-            # unavailable.  Keeping the visitor session would produce a false
-            # login success.
+        res = _read_qr_response('二维码登录凭证换取', resp)
+        data = res.get('data')
+        if not isinstance(data, dict):
+            raise _qr_response_error('二维码登录凭证解析', resp, res)
+
+        login_info = data.get('login_info') or data.get('loginInfo') or {}
+        session = login_info.get('session') if isinstance(login_info, dict) else None
+        if isinstance(session, str) and session.strip() and session != visitor_session:
+            # A newly issued login_info.session proves the exchange completed;
+            # do not require a redundant numeric code_status=2 alongside it.
             cookies.pop('web_session', None)
             cookies['web_session'] = session
-            self.profile.update_cookies(cookies)
-        elif not cookies.get('web_session') or cookies.get('web_session') == visitor_session:
-            raise RuntimeError('二维码登录响应缺少正式 web_session')
+            self._ensure_profile(cookies)
+        elif (
+            _qr_status(data) != 2
+            or not cookies.get('web_session')
+            or cookies.get('web_session') == visitor_session
+        ):
+            # Without an explicit login session, require both confirmed status
+            # and a new Set-Cookie session. "msg: 成功" alone is never sufficient.
+            raise _qr_response_error('二维码登录凭证校验（缺少正式 web_session）', resp, res)
 
         return cookies
 
@@ -666,8 +784,10 @@ class XHSLoginApi:
         )
         self._merge_response_cookies(cookies, resp)
 
+        if resp.status_code == 471:
+            raise XhsLoginBlockedError('登录账号信息获取')
         res = resp.json()
-        return res.get('success', False), res.get('data', {}), cookies
+        return bool(resp.ok and _qr_request_succeeded(res)), res.get('data', {}), cookies
 
     def send_phone_code(self, phone, cookies, zone='86'):
         api = '/api/sns/web/v2/login/send_code'

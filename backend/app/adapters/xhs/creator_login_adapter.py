@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+from backend.app.adapters.xhs.pc_login_adapter import _qr_status_from_message
 from backend.app.adapters.xhs.request_env import direct_xhs_request_env
+
+logger = logging.getLogger(__name__)
 
 
 class XhsCreatorLoginAdapter:
@@ -37,11 +41,7 @@ class XhsCreatorLoginAdapter:
 
             api = XHSCreatorLoginApi()
             success, message, updated_cookies = api.check_qrcode_status(qr_id, cookies)
-        status = "confirmed" if success else "pending"
-        if "过期" in message or "expired" in message.lower():
-            status = "expired"
-        if "确认" in message or "confirm" in message.lower():
-            status = "scanned"
+        status = _qr_status_from_message(success, message)
         return {"status": status, "cookies": updated_cookies}
 
     def get_user_info(self, cookies: dict[str, Any]) -> dict[str, Any]:

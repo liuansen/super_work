@@ -7,10 +7,12 @@ const fs = require('fs');
 const { buildRapPure } = require('./rap.js');
 
 const api = process.argv[2];
-const data = process.argv[3] || '';
+const dataArg = process.argv[3] || '';
+// 支持 '@<path>' 形式：长请求体不进命令行（避免进程列表泄露正文与命令行长度上限）
+const data = dataArg.startsWith('@') ? fs.readFileSync(dataArg.slice(1), 'utf8') : dataArg;
 const appId = process.argv[4] || undefined;
 const fingerprintHex = process.argv[5] || '';
-if (!api) { process.stderr.write('usage: rap_cli.js <api> [data] [appId]\n'); process.exit(2); }
+if (!api) { process.stderr.write('usage: rap_cli.js <api> [data|@dataFile] [appId]\n'); process.exit(2); }
 
 // Fingerprint template: 219-byte captured behavior/detection blob (session-safe reuse)
 const TPL_PATH = path.join(__dirname, 'rap_fingerprint_template.json');

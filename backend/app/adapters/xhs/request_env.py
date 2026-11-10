@@ -1,35 +1,16 @@
 from __future__ import annotations
 
-import os
-import threading
 from contextlib import contextmanager
 from collections.abc import Iterator
 
 
-PROXY_ENV_KEYS = (
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "ALL_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "all_proxy",
-)
-
-_proxy_env_lock = threading.RLock()
-
-
 @contextmanager
 def direct_xhs_request_env() -> Iterator[None]:
-    """Run Spider_XHS SDK calls without inheriting a broken local proxy."""
-    with _proxy_env_lock:
-        original = {key: os.environ.get(key) for key in PROXY_ENV_KEYS}
-        for key in PROXY_ENV_KEYS:
-            os.environ.pop(key, None)
-        try:
-            yield
-        finally:
-            for key, value in original.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+    """兼容占位：XHS 传输层已显式忽略环境代理，这里不再改动 os.environ。
+
+    旧实现会持锁删除进程级 HTTP_PROXY/HTTPS_PROXY 等变量，影响所有并发线程
+    （FastAPI 线程池 + 调度器线程）里其他依赖环境代理的请求。现在
+    ``BrowserHttpClient`` 以 ``trust_env=False`` 创建 Session，不继承环境
+    代理；需要使用代理时由调用方显式传 ``proxies``。
+    """
+    yield None

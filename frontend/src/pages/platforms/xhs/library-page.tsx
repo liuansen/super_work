@@ -30,6 +30,7 @@ import {
   Image,
   Input,
   Modal,
+  Pagination,
   Popconfirm,
   Row,
   Segmented,
@@ -167,6 +168,9 @@ export function XhsLibraryPage() {
   const navigate = useNavigate();
   const [notes, setNotes] = useState<SavedNote[]>([]);
   const [total, setTotal] = useState(0);
+  // 服务端分页：此前只取第一页（默认 20 条），第 21 条以后的笔记永远不可见
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedNote, setSelectedNote] = useState<SavedNote | null>(null);
@@ -199,12 +203,20 @@ export function XhsLibraryPage() {
 
   const selectedNoteIdSet = new Set(selectedNoteIds);
 
-  async function loadNotes(overrideFilters?: { q?: string; tag_id?: number; has_assets?: boolean; has_comments?: boolean }) {
+  async function loadNotes(
+    overrideFilters?: { q?: string; tag_id?: number; has_assets?: boolean; has_comments?: boolean },
+    targetPage?: number,
+    targetPageSize?: number
+  ) {
     setIsLoading(true); setError(null);
     const f = overrideFilters ?? { q: keywordFilter.trim() || undefined, tag_id: selectedTagFilter ? Number(selectedTagFilter) : undefined, has_assets: hasAssetsFilter || undefined, has_comments: hasCommentsFilter || undefined };
+    const nextPage = targetPage ?? page;
+    const nextPageSize = targetPageSize ?? pageSize;
     try {
-      const r = await fetchSavedNotes({ platform: "xhs", ...f });
+      const r = await fetchSavedNotes({ platform: "xhs", ...f, page: nextPage, page_size: nextPageSize });
       setNotes(r.items); setTotal(r.total);
+      setPage(nextPage);
+      setPageSize(nextPageSize);
       const ids = new Set(r.items.map((n) => n.id));
       setSelectedNoteIds((c) => c.filter((id) => ids.has(id)));
     } catch { setError("内容库加载失败。"); } finally { setIsLoading(false); }
@@ -398,7 +410,16 @@ export function XhsLibraryPage() {
         <Empty description="内容库还是空的"><Link to="/platforms/xhs/discovery"><Button type="primary" icon={<BookOutlined />}>去发现笔记</Button></Link></Empty>
       ) : viewMode === "table" ? (
         <Card size="small">
-          <Table<SavedNote> columns={tableColumns} dataSource={notes} rowKey="id" size="small" pagination={{ pageSize: 20 }}
+          <Table<SavedNote> columns={tableColumns} dataSource={notes} rowKey="id" size="small"
+            pagination={{
+              current: page,
+              pageSize,
+              total,
+              showSizeChanger: true,
+              pageSizeOptions: [10, 20, 50, 100],
+              showTotal: (t) => `共 ${t} 条`,
+              onChange: (nextPage, nextPageSize) => void loadNotes(undefined, nextPage, nextPageSize),
+            }}
             rowSelection={{ selectedRowKeys: selectedNoteIds, onChange: (keys) => setSelectedNoteIds(keys as number[]) }}
             onRow={(n) => ({ onClick: () => void openDetail(n), style: { cursor: "pointer" } })} />
         </Card>
@@ -443,6 +464,20 @@ export function XhsLibraryPage() {
             );
           })}
         </Row>
+      )}
+
+      {!isLoading && notes.length > 0 && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showSizeChanger
+            pageSizeOptions={[10, 20, 50, 100]}
+            showTotal={(t) => `共 ${t} 条`}
+            onChange={(nextPage, nextPageSize) => void loadNotes(undefined, nextPage, nextPageSize)}
+          />
+        </div>
       )}
 
       <Drawer title={selectedNote?.title || "笔记详情"} open={isDetailOpen} onClose={closeDetail} width={640} styles={{ body: { background: "#1a1a1a" } }}>

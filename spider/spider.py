@@ -8,11 +8,20 @@ from xhs_utils.xhs_pc import XHSPcAuth
 
 
 class Data_Spider():
+    # 缓存上限：以 Cookie 为 key 的缓存永不淘汰会持续泄漏内存与 HTTP 会话
+    _MAX_CACHED_APIS = 8
+
     def __init__(self):
         self._apis_cache = {}
 
     def _api(self, cookies_str: str):
         if cookies_str not in self._apis_cache:
+            while len(self._apis_cache) >= self._MAX_CACHED_APIS:
+                _, evicted = self._apis_cache.popitem()
+                try:
+                    evicted.auth.close()
+                except Exception:
+                    pass
             auth = XHSPcAuth.from_cookie(cookies_str)
             self._apis_cache[cookies_str] = XHS_Apis(auth)
         return self._apis_cache[cookies_str]

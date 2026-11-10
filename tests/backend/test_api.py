@@ -66,17 +66,33 @@ def test_accounts_page_uses_antd_components_and_shows_check_state():
     assert "检查" in source
 
 
-def test_xhs_direct_request_env_temporarily_removes_proxy_variables(monkeypatch):
-    from backend.app.adapters.xhs.request_env import PROXY_ENV_KEYS, direct_xhs_request_env
+def test_xhs_direct_request_env_does_not_mutate_process_env(monkeypatch):
+    """代理隔离已下沉到 HTTP 会话层（trust_env=False）。
+
+    旧的实现会全局删除 os.environ 里的代理变量，影响其他并发线程；
+    现在该上下文管理器必须是无副作用的。
+    """
+    from backend.app.adapters.xhs.request_env import direct_xhs_request_env
 
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:10809")
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:10809")
 
     with direct_xhs_request_env():
-        assert all(key not in os.environ for key in PROXY_ENV_KEYS)
+        assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:10809"
+        assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:10809"
 
     assert os.environ["HTTPS_PROXY"] == "http://127.0.0.1:10809"
-    assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:10809"
+
+
+def test_browser_http_client_does_not_inherit_env_proxy():
+    """XHS 传输层默认不继承环境代理（线程安全的代理隔离方式）。"""
+    import inspect
+
+    from xhs_utils.xhs_core.http import BrowserHttpClient
+
+    source = inspect.getsource(BrowserHttpClient.__init__)
+    assert "trust_env=trust_env" in source
+    assert "trust_env: bool = False" in source
 
 
 def test_xhs_adapters_isolate_sdk_calls_from_broken_system_proxy():
@@ -3326,7 +3342,7 @@ def test_xhs_creator_routes_use_owned_creator_account_and_record_tasks(tmp_path)
         upload_response = client.post(
             "/api/xhs/creator/assets/upload",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"account_id": creator_account_id, "file_path": "storage/media/cover.png", "media_type": "image"},
+            json={"account_id": creator_account_id, "file_path": "cover.png", "media_type": "image"},
         )
         assert upload_response.status_code == 200
         assert upload_response.json()["payload"]["fileIds"] == "file-creator-001"
@@ -5158,13 +5174,13 @@ def test_publish_assets_api_adds_lists_and_deletes_owned_assets(tmp_path):
         create_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         assert create_response.status_code == 200
         created = create_response.json()
         assert created["publish_job_id"] == job_id
         assert created["asset_type"] == "image"
-        assert created["file_path"] == "storage/media/cover.png"
+        assert created["file_path"] == "cover.png"
 
         list_response = client.get(
             f"/api/publish/jobs/{job_id}/assets",
@@ -5246,7 +5262,7 @@ def test_publish_asset_upload_uses_creator_cookie_and_updates_asset(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
 
@@ -5263,7 +5279,7 @@ def test_publish_asset_upload_uses_creator_cookie_and_updates_asset(tmp_path):
         assert FakeCreatorPublishAdapter.calls == [
             {
                 "cookies": "web_session=creator-session; a1=creator-a1",
-                "file_path": "storage/media/cover.png",
+                "file_path": "cover.png",
                 "media_type": "image",
             }
         ]
@@ -5300,7 +5316,7 @@ def test_publish_asset_upload_rejects_cross_user_asset(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
 
@@ -5364,7 +5380,7 @@ def test_publish_job_publish_uses_creator_cookie_and_updates_status(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
         upload_response = client.post(
@@ -5470,7 +5486,7 @@ def test_publish_job_publish_passes_optional_creator_parameters(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
         upload_response = client.post(
@@ -5558,7 +5574,7 @@ def test_publish_job_publish_records_failed_task(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
         upload_response = client.post(
@@ -5682,7 +5698,7 @@ def test_publish_job_publish_rejects_past_scheduled_time_before_adapter(tmp_path
                 PublishAsset(
                     publish_job_id=job_id,
                     asset_type="image",
-                    file_path="storage/media/cover.png",
+                    file_path="cover.png",
                     upload_status="uploaded",
                     creator_media_id="creator-media-001",
                     creator_upload_info='{"fileIds":"file-001","width":1080,"height":1440}',
@@ -5748,7 +5764,7 @@ def test_publish_job_publish_rejects_already_completed_job(tmp_path):
         asset_response = client.post(
             f"/api/publish/jobs/{job_id}/assets",
             headers={"Authorization": f"Bearer {owner_token}"},
-            json={"asset_type": "image", "file_path": "storage/media/cover.png"},
+            json={"asset_type": "image", "file_path": "cover.png"},
         )
         asset_id = asset_response.json()["id"]
         upload_response = client.post(
@@ -5769,7 +5785,7 @@ def test_publish_job_publish_rejects_already_completed_job(tmp_path):
         )
 
         assert second_response.status_code == 400
-        assert second_response.json()["detail"] == "Publish job is already completed"
+        assert second_response.json()["detail"] == "Publish job is already completed or in progress"
         assert len(FakeCreatorPublishAdapter.calls) == 1
         db = next(app.dependency_overrides[get_db]())
         try:
@@ -5833,7 +5849,7 @@ def test_image_utility_routes_require_authentication(tmp_path):
 
         assert compose_response.status_code == 401
         assert resize_response.status_code == 401
-        assert download_response.status_code == 404
+        assert download_response.status_code == 401
     finally:
         app.dependency_overrides.pop(db_dependency, None)
 
@@ -5904,8 +5920,9 @@ def test_image_utilities_compose_resize_download_and_enforce_scope(tmp_path):
 
         forbidden_download = client.get(
             composed["download_url"],
+            headers={"Authorization": f"Bearer {intruder_token}"},
         )
-        assert forbidden_download.status_code == 200
+        assert forbidden_download.status_code == 404
 
         forbidden_resize = client.post(
             "/api/files/images/resize",
@@ -6346,10 +6363,10 @@ def test_due_publish_scheduler_registers_interval_job():
 
     try:
         jobs = scheduler.get_jobs()
-        assert {job.id for job in jobs} == {"due_publish_runner", "monitoring_refresh_runner", "auto_tasks_runner", "cookie_health_checker"}
+        # 未传 monitoring_job_func 时不得把发布函数重复注册成第二个 job id
+        assert {job.id for job in jobs} == {"due_publish_runner", "auto_tasks_runner", "cookie_health_checker"}
         job_intervals = {job.id: job.trigger.interval.total_seconds() for job in jobs}
         assert job_intervals["due_publish_runner"] == 17
-        assert job_intervals["monitoring_refresh_runner"] == 17
         assert job_intervals["auto_tasks_runner"] == 60
         assert job_intervals["cookie_health_checker"] == 7200
     finally:
@@ -6461,3 +6478,393 @@ def test_run_monitoring_refresh_for_all_users_refreshes_active_targets(tmp_path)
             db.close()
     finally:
         app.dependency_overrides.pop(db_dependency, None)
+
+
+def test_publish_asset_rejects_path_traversal_and_off_whitelist_url(tmp_path):
+    """P0 回归：发布素材 file_path 不允许任意本地路径 / 非白名单域名 URL。"""
+    from backend.app.core.database import get_db
+
+    db_dependency = _override_database(tmp_path)
+    try:
+        token = _register_and_get_access_token("media-guard-owner")
+        draft_response = client.post(
+            "/api/drafts",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"platform": "xhs", "title": "Guard", "body": "Guard"},
+        )
+        assert draft_response.status_code == 200
+        draft_id = draft_response.json()["id"]
+        job_response = client.post(
+            f"/api/drafts/{draft_id}/send-to-publish",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+        )
+        assert job_response.status_code == 200, job_response.text
+        job_id = job_response.json()["id"]
+
+        for bad_path in (
+            "../../etc/passwd",
+            "storage/media/cover.png",
+            "C:/code/super_work/backend/.env",
+            "http://169.254.169.254/latest/meta-data",
+            "https://evil.example.com/a.jpg",
+        ):
+            response = client.post(
+                f"/api/publish/jobs/{job_id}/assets",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"asset_type": "image", "file_path": bad_path},
+            )
+            assert response.status_code == 422, bad_path
+
+        # 合法来源：媒体文件名 / 平台 CDN URL
+        ok_name = client.post(
+            f"/api/publish/jobs/{job_id}/assets",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"asset_type": "image", "file_path": "cover.png"},
+        )
+        assert ok_name.status_code == 200
+        ok_cdn = client.post(
+            f"/api/publish/jobs/{job_id}/assets",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"asset_type": "image", "file_path": "https://sns-webpic-qc.xhscdn.com/a.jpg"},
+        )
+        assert ok_cdn.status_code == 200
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+
+
+def test_media_download_requires_auth_and_owner_prefix(tmp_path):
+    """P1 回归：/api/files/media 需要鉴权且校验属主前缀。"""
+    db_dependency = _override_database(tmp_path)
+    try:
+        # 未认证 → 401（注意：TestClient 会保存 cookie，须在任何注册/登录之前检查）
+        anonymous = client.get("/api/files/media/whatever.png")
+        assert anonymous.status_code == 401
+
+        token = _register_and_get_access_token("media-view-owner")
+        other_token = _register_and_get_access_token("media-view-other")
+
+        # 上传一个属主文件
+        upload = client.post(
+            "/api/files/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"file": ("cover.png", b"\x89PNG\r\n\x1a\n" + b"0" * 64, "image/png")},
+        )
+        assert upload.status_code == 200
+        file_name = upload.json()["file_name"]
+        assert file_name.startswith("xhs-upload-u")
+
+        # 属主可读（Bearer）
+        owner_resp = client.get(
+            f"/api/files/media/{file_name}", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert owner_resp.status_code == 200
+        # 属主可读（media_token cookie，模拟 <img> 场景）
+        register_resp = client.post(
+            "/api/auth/login", json={"username": "media-view-owner", "password": "secret123"}
+        )
+        media_cookie = register_resp.cookies.get("media_token")
+        assert media_cookie
+        cookie_resp = client.get(f"/api/files/media/{file_name}", cookies={"media_token": media_cookie})
+        assert cookie_resp.status_code == 200
+        # 其他用户 → 404（属主前缀不匹配）
+        other_resp = client.get(
+            f"/api/files/media/{file_name}", headers={"Authorization": f"Bearer {other_token}"}
+        )
+        assert other_resp.status_code == 404
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+
+
+def test_publish_job_claim_is_atomic_and_reconcile_resets_stale(tmp_path):
+    """P1 回归：条件 UPDATE 领取防止并发重复发布；启动对账复位滞留任务。"""
+    from datetime import timedelta
+
+    from backend.app.core.database import get_db
+    from backend.app.core.time import shanghai_now
+    from backend.app.models import PublishJob
+    from backend.app.services.scheduler_service import (
+        _claim_publish_job,
+        reconcile_stale_publish_jobs,
+    )
+
+    db_dependency = _override_database(tmp_path)
+    try:
+        token = _register_and_get_access_token("claim-owner")
+        from sqlalchemy import insert
+
+        db = next(app.dependency_overrides[get_db]())
+        try:
+            db.execute(insert(PublishJob).values(
+                user_id=1, platform="xhs", title="Claim", body="b",
+                publish_mode="immediate", status="pending",
+            ))
+            db.commit()
+            job_id = db.scalars(select(PublishJob).where(PublishJob.title == "Claim")).first().id
+
+            # 第一次领取成功，第二次（并发方）失败
+            assert _claim_publish_job(db, job_id) is True
+            assert _claim_publish_job(db, job_id) is False
+            job = db.get(PublishJob, job_id)
+            assert job.status == "publishing"
+            assert job.publish_started_at is not None
+
+            # 刚领取的任务不在对账范围（未超时）
+            result = reconcile_stale_publish_jobs(db=db)
+            assert result["reset_publish_jobs"] == 0
+            assert db.get(PublishJob, job_id).status == "publishing"
+
+            # 超时后（模拟 31 分钟前领取）被复位为 failed
+            job.publish_started_at = shanghai_now() - timedelta(minutes=31)
+            db.commit()
+            result = reconcile_stale_publish_jobs(db=db)
+            assert result["reset_publish_jobs"] == 1
+            reset = db.get(PublishJob, job_id)
+            assert reset.status == "failed"
+            assert "中断" in reset.publish_error
+        finally:
+            db.close()
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+
+
+def test_media_source_guard_rejects_arbitrary_paths_and_hosts():
+    """P0 回归：素材来源校验（路径穿越 / 非白名单域名 / 协议）。"""
+    from backend.app.core.media_source import (
+        InvalidMediaSource,
+        validate_media_file_name,
+        validate_media_source,
+    )
+
+    for bad in ("../../etc/passwd", "/etc/passwd", "C:\Windows\win.ini", "storage/media/a.png", ""):
+        try:
+            validate_media_source(bad)
+        except InvalidMediaSource:
+            pass
+        else:
+            raise AssertionError(f"应拒绝: {bad!r}")
+
+    for bad_url in ("ftp://x.com/a.png", "http://127.0.0.1/a.png", "http://169.254.169.254/a.png",
+                    "https://evil.example.com/a.png"):
+        try:
+            validate_media_source(bad_url)
+        except InvalidMediaSource:
+            pass
+        else:
+            raise AssertionError(f"应拒绝: {bad_url!r}")
+
+    for good in ("cover.png", "/api/files/media/xhs-upload-u1-a.jpg",
+                 "https://sns-img-qc.xhscdn.com/abc.jpg",
+                 "https://www.xiaohongshu.com/a.png"):
+        validate_media_source(good)
+
+    try:
+        validate_media_file_name("../x.png")
+    except InvalidMediaSource:
+        pass
+    else:
+        raise AssertionError("文件名不应允许路径成分")
+
+
+def test_ai_generate_titles_keeps_leading_digits():
+    """P2 回归：标题清洗不能把开头的数字一并剥掉（"3天瘦5斤"→"天瘦5斤"）。"""
+    from backend.app.services.ai_service import _ORDERED_LIST_PREFIX_RE
+
+    cases = {
+        "1. 3天瘦5斤": "3天瘦5斤",
+        "2、TOP10 必买": "TOP10 必买",
+        "3) 5分钟早餐": "5分钟早餐",
+        "7天自律计划": "7天自律计划",
+        "- 干货分享": "干货分享",
+    }
+    for raw, expected in cases.items():
+        assert _ORDERED_LIST_PREFIX_RE.sub("", raw).strip() == expected, raw
+
+
+def test_scheduled_at_with_offset_normalized_to_beijing_naive():
+    """P1 回归：带时区偏移的定时时间统一转为 naive 北京时间。"""
+    from datetime import datetime
+
+    from backend.app.api.publish import PublishJobUpdateRequest
+
+    payload = PublishJobUpdateRequest(scheduled_at=datetime.fromisoformat("2026-11-11T20:00:00+08:00"))
+    assert payload.scheduled_at == datetime(2026, 11, 11, 20, 0)
+
+    # UTC 12:00 == 北京 20:00
+    payload_utc = PublishJobUpdateRequest(scheduled_at=datetime.fromisoformat("2026-11-11T12:00:00+00:00"))
+    assert payload_utc.scheduled_at == datetime(2026, 11, 11, 20, 0)
+
+    # naive 值按北京时间原样保留
+    payload_naive = PublishJobUpdateRequest(scheduled_at=datetime(2026, 11, 11, 20, 0))
+    assert payload_naive.scheduled_at == datetime(2026, 11, 11, 20, 0)
+
+
+def test_qr_login_poll_is_idempotent_after_user_info_failure(tmp_path):
+    """扫码确认后取账号信息失败 → 502；再次轮询不应重复换取二维码，应续跑成功。"""
+    from backend.app.api.login_sessions import get_creator_login_adapter, get_pc_login_adapter
+    from backend.app.core.database import get_db
+    from backend.app.models import LoginSession
+
+    class FlakyUserInfoAdapter:
+        check_calls = 0
+        userinfo_calls = 0
+
+        def create_qrcode(self):
+            return {"cookies": {"a1": "temp-a1"}, "qr_id": "qr-flaky", "code": "code-flaky",
+                    "qr_url": "https://example.test/qr-flaky"}
+
+        def check_qrcode_status(self, qr_id, code, cookies):
+            type(self).check_calls += 1
+            return {"status": "confirmed", "cookies": {"a1": "final-a1", "web_session": "session-flaky"}}
+
+        def get_user_info(self, cookies):
+            type(self).userinfo_calls += 1
+            if type(self).userinfo_calls == 1:
+                raise RuntimeError("upstream user/me busy")
+            return {"external_user_id": "flaky-user", "nickname": "flaky-cat", "avatar_url": ""}
+
+    db_dependency = _override_database(tmp_path)
+    adapter = FlakyUserInfoAdapter()
+    app.dependency_overrides[get_pc_login_adapter] = lambda: adapter
+    app.dependency_overrides[get_creator_login_adapter] = lambda: FailingCreatorExchangeAdapter()
+    try:
+        token = _register_and_get_access_token("qr-flaky-owner")
+        created = client.post(
+            "/api/xhs/login-sessions/pc/qrcode",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        session_id = created["session_id"]
+
+        first = client.get(
+            f"/api/xhs/login-sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert first.status_code == 502
+        assert "获取账号信息失败" in first.json()["detail"]
+
+        # 会话不能被错误地置为终态：仍可重试
+        db = next(app.dependency_overrides[get_db]())
+        try:
+            session = db.get(LoginSession, session_id)
+            assert session.status == "scanned"
+        finally:
+            db.close()
+
+        second = client.get(
+            f"/api/xhs/login-sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert second.status_code == 200, second.text
+        payload = second.json()
+        assert payload["status"] == "confirmed"
+        assert payload["account"]["nickname"] == "flaky-cat"
+        # 二维码只换取一次
+        assert FlakyUserInfoAdapter.check_calls == 1
+        assert FlakyUserInfoAdapter.userinfo_calls == 2
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+        app.dependency_overrides.pop(get_pc_login_adapter, None)
+        app.dependency_overrides.pop(get_creator_login_adapter, None)
+
+
+def test_qr_login_concurrent_poll_does_not_hit_upstream_twice(tmp_path):
+    """并发轮询：同一会话已有请求在处理时，另一次轮询直接复用状态，不再打上游。"""
+    from backend.app.api.login_sessions import (
+        _session_lock,
+        get_creator_login_adapter,
+        get_pc_login_adapter,
+    )
+
+    class CountingAdapter:
+        check_calls = 0
+
+        def create_qrcode(self):
+            return {"cookies": {"a1": "temp-a1"}, "qr_id": "qr-conc", "code": "code-conc",
+                    "qr_url": "https://example.test/qr-conc"}
+
+        def check_qrcode_status(self, qr_id, code, cookies):
+            type(self).check_calls += 1
+            return {"status": "scanned", "cookies": cookies}
+
+        def get_user_info(self, cookies):
+            return {"external_user_id": "conc-user", "nickname": "conc", "avatar_url": ""}
+
+    db_dependency = _override_database(tmp_path)
+    app.dependency_overrides[get_pc_login_adapter] = lambda: CountingAdapter()
+    app.dependency_overrides[get_creator_login_adapter] = lambda: FailingCreatorExchangeAdapter()
+    try:
+        token = _register_and_get_access_token("qr-conc-owner")
+        created = client.post(
+            "/api/xhs/login-sessions/pc/qrcode",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        session_id = created["session_id"]
+
+        lock = _session_lock(session_id)
+        acquired = lock.acquire(blocking=False)
+        assert acquired
+        try:
+            busy = client.get(
+                f"/api/xhs/login-sessions/{session_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        finally:
+            lock.release()
+        assert busy.status_code == 200
+        assert busy.json().get("polling") is True
+        assert CountingAdapter.check_calls == 0
+
+        normal = client.get(
+            f"/api/xhs/login-sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert normal.status_code == 200
+        assert normal.json()["status"] == "scanned"
+        assert CountingAdapter.check_calls == 1
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+        app.dependency_overrides.pop(get_pc_login_adapter, None)
+        app.dependency_overrides.pop(get_creator_login_adapter, None)
+
+
+def test_qr_login_poll_with_undecryptable_state_expires_session(tmp_path):
+    """密钥变更/数据损坏导致无法解密时，返回 409 并将会话置为 expired（而非 500）。"""
+    from backend.app.api.login_sessions import get_creator_login_adapter, get_pc_login_adapter
+    from backend.app.core.database import get_db
+    from backend.app.models import LoginSession
+
+    db_dependency = _override_database(tmp_path)
+    app.dependency_overrides[get_pc_login_adapter] = lambda: FakePcLoginAdapter()
+    app.dependency_overrides[get_creator_login_adapter] = lambda: FailingCreatorExchangeAdapter()
+    try:
+        token = _register_and_get_access_token("qr-badtoken-owner")
+        created = client.post(
+            "/api/xhs/login-sessions/pc/qrcode",
+            headers={"Authorization": f"Bearer {token}"},
+        ).json()
+        session_id = created["session_id"]
+
+        db = next(app.dependency_overrides[get_db]())
+        try:
+            session = db.get(LoginSession, session_id)
+            session.encrypted_temp_cookies = "not-a-valid-fernet-token"
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            f"/api/xhs/login-sessions/{session_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 409
+        assert "密钥" in response.json()["detail"]
+
+        db = next(app.dependency_overrides[get_db]())
+        try:
+            assert db.get(LoginSession, session_id).status == "expired"
+        finally:
+            db.close()
+    finally:
+        app.dependency_overrides.pop(db_dependency, None)
+        app.dependency_overrides.pop(get_pc_login_adapter, None)
+        app.dependency_overrides.pop(get_creator_login_adapter, None)

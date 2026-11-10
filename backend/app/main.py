@@ -13,12 +13,21 @@ from backend.app.api.platforms.douyin import router as douyin_router
 from backend.app.api.platforms.xhs import analytics, crawl, creator, monitoring, pc
 from backend.app.core.config import get_settings
 from backend.app.core.database import init_db
-from backend.app.services.scheduler_service import run_due_auto_tasks, shutdown_due_publish_scheduler, start_due_publish_scheduler
+from backend.app.services.scheduler_service import (
+    reconcile_stale_publish_jobs,
+    shutdown_due_publish_scheduler,
+    start_due_publish_scheduler,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 启动对账：把进程崩溃/重启时滞留在中间态的任务复位，避免永久卡死
+    reconcile_stale_publish_jobs()
+    from backend.app.douyin.publishing import reconcile_stale_tasks
+
+    reconcile_stale_tasks()
     settings = get_settings()
     scheduler = None
     if settings.scheduler_enabled:

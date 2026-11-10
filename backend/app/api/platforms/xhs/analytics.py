@@ -16,6 +16,7 @@ from backend.app.core.config import get_settings
 from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.core.time import shanghai_now
+from backend.app.services.export_cleanup import prune_user_exports
 from backend.app.models import AiDraft, KeywordGroup, MonitoringTarget, Note, NoteComment, PlatformAccount, PublishJob, Tag, User, note_tags
 
 router = APIRouter(prefix="/xhs/analytics", tags=["xhs-analytics"])
@@ -339,6 +340,8 @@ def _write_report_file(current_user: User, payload: dict[str, Any]) -> tuple[str
     file_name = f"xhs-report-u{current_user.id}-{uuid4().hex}.json"
     file_path = export_dir / file_name
     file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 每用户保留最近 10 份报告文件
+    prune_user_exports(export_dir, current_user.id, "report")
     return file_name, file_path
 
 

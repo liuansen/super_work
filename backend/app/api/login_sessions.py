@@ -3,7 +3,11 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
+import threading
+from weakref import WeakValueDictionary
 
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -15,6 +19,7 @@ from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text, encrypt_text
 from backend.app.models import LoginSession, PlatformAccount, User
 from backend.app.adapters.xhs.pc_api_adapter import XhsPcApiAdapter
+from xhs_utils.xhs_core.errors import XhsLoginBlockedError
 from backend.app.services.account_service import (
     cookie_header_from_text,
     enrich_user_info_with_xhs_self_profile,
@@ -22,7 +27,23 @@ from backend.app.services.account_service import (
     upsert_platform_account_from_login,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/xhs/login-sessions", tags=["xhs-login-sessions"])
+
+# 同一进程内串行处理每个登录会话，避免并发重复换取凭证。
+# 弱引用保证仍有调用方持有锁时不会创建第二把锁，无请求引用后自动清理。
+_session_locks: WeakValueDictionary = WeakValueDictionary()
+_session_locks_guard = threading.Lock()
+
+
+def _session_lock(session_id: int) -> threading.Lock:
+    with _session_locks_guard:
+        lock = _session_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _session_locks[session_id] = lock
+        return lock
 
 
 class PcQrCodeRequest(BaseModel):
@@ -51,19 +72,69 @@ def _load_json(value: str | None) -> dict:
     return json.loads(value)
 
 
-def _dump_temp_state(cookies: dict, *, sync_creator: bool = False) -> str:
-    if sync_creator:
-        return _dump_json({"cookies": cookies, "sync_creator": True})
+def _dump_temp_state(
+    cookies: dict,
+    *,
+    sync_creator: bool = False,
+    exchanged: bool = False,
+    account_id: int | None = None,
+    creator_account_id: int | None = None,
+    login_state: dict | None = None,
+    login_error: dict | None = None,
+) -> str:
+    """保存会话临时状态。
+
+    exchanged=True 表示“二维码已换取正式 web_session”，后续轮询必须跳过
+    状态校验（二维码只能消费一次，重复换取会被上游拒绝）。
+    """
+    if sync_creator or exchanged or account_id is not None or login_state is not None or login_error is not None:
+        payload: dict = {"cookies": cookies}
+        if sync_creator:
+            payload["sync_creator"] = True
+        if exchanged:
+            payload["exchanged"] = True
+        if account_id is not None:
+            payload["account_id"] = account_id
+        if creator_account_id is not None:
+            payload["creator_account_id"] = creator_account_id
+        if login_state is not None:
+            payload["login_state"] = login_state
+        if login_error is not None:
+            payload["login_error"] = login_error
+        return _dump_json(payload)
     return _dump_json(cookies)
 
 
-def _load_temp_state(value: str | None) -> tuple[dict, bool]:
+def _load_temp_state(value: str | None) -> tuple[dict, bool, bool]:
     payload = _load_json(value)
     if isinstance(payload, dict) and isinstance(payload.get("cookies"), dict):
-        return payload["cookies"], bool(payload.get("sync_creator"))
+        return (
+            payload["cookies"],
+            bool(payload.get("sync_creator")),
+            bool(payload.get("exchanged")),
+        )
     if isinstance(payload, dict):
-        return payload, False
-    return {}, False
+        return payload, False, False
+    return {}, False, False
+
+
+def _expire_stale_sessions(db: Session, *, user_id: int, sub_type: str) -> None:
+    """同一用户同类型的旧待扫码会话置为 expired。
+
+    前端每次挂载/切换参数都会新建会话，旧会话若保持 pending 会一直
+    被轮询（甚至被误扫），也让登录会话表无限增长。
+    """
+    from sqlalchemy import select
+
+    stale = db.scalars(
+        select(LoginSession).where(
+            LoginSession.user_id == user_id,
+            LoginSession.sub_type == sub_type,
+            LoginSession.status.in_(("pending", "scanned")),
+        )
+    ).all()
+    for item in stale:
+        item.status = "expired"
 
 
 def _qr_data_url(qr_url: str) -> str:
@@ -147,11 +218,14 @@ def pc_qrcode(
     payload = payload or PcQrCodeRequest()
     try:
         qr_payload = adapter.create_qrcode()
+    except XhsLoginBlockedError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"XHS PC QR code generation failed: {exc}",
         ) from exc
+    _expire_stale_sessions(db, user_id=current_user.id, sub_type="pc")
     session = LoginSession(
         user_id=current_user.id,
         platform="xhs",
@@ -161,7 +235,11 @@ def pc_qrcode(
         code=qr_payload["code"],
         qr_url=qr_payload["qr_url"],
         encrypted_temp_cookies=encrypt_text(
-            _dump_temp_state(qr_payload["cookies"], sync_creator=payload.sync_creator)
+            _dump_temp_state(
+                qr_payload["cookies"],
+                sync_creator=payload.sync_creator,
+                login_state=qr_payload.get("login_state"),
+            )
         ),
     )
     db.add(session)
@@ -188,6 +266,7 @@ def creator_qrcode(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"XHS Creator QR code generation failed: {exc}",
         ) from exc
+    _expire_stale_sessions(db, user_id=current_user.id, sub_type="creator")
     session = LoginSession(
         user_id=current_user.id,
         platform="xhs",
@@ -208,6 +287,37 @@ def creator_qrcode(
     }
 
 
+def _terminal_login_response(db: Session, session: LoginSession) -> dict:
+    payload = {
+        "session_id": session.id,
+        "status": session.status,
+        "qr_url": session.qr_url,
+        "account": None,
+        "creator_account": None,
+    }
+    if session.status not in {"confirmed", "blocked"}:
+        return payload
+    try:
+        state = _load_json(decrypt_text(session.encrypted_temp_cookies))
+    except (InvalidToken, json.JSONDecodeError):
+        session.status = "expired"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="登录会话数据已失效，请刷新二维码后重新扫码",
+        )
+    if session.status == "blocked":
+        payload.update(state.get("login_error") or {})
+        return payload
+    for response_key, state_key in (("account", "account_id"), ("creator_account", "creator_account_id")):
+        account_id = state.get(state_key)
+        if isinstance(account_id, int):
+            account = db.get(PlatformAccount, account_id)
+            if account is not None and account.user_id == session.user_id:
+                payload[response_key] = serialize_account(account)
+    return payload
+
+
 @router.get("/{session_id}")
 def login_session(
     session_id: int,
@@ -219,47 +329,194 @@ def login_session(
     session = db.get(LoginSession, session_id)
     if session is None or session.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Login session not found")
-    if session.status in {"confirmed", "expired"}:
-        return {"session_id": session.id, "status": session.status, "qr_url": session.qr_url}
-    if session.sub_type not in {"pc", "creator"} or not session.qr_id:
+    if session.status not in {"confirmed", "expired", "blocked"} and (
+        session.sub_type not in {"pc", "creator"} or not session.qr_id
+    ):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported login session")
 
-    cookies, sync_creator = _load_temp_state(decrypt_text(session.encrypted_temp_cookies))
-    if session.sub_type == "pc":
-        if not session.code:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported login session")
-        result = pc_adapter.check_qrcode_status(session.qr_id, session.code, cookies)
-        account_sub_type = "pc"
-        user_info = pc_adapter.get_user_info(result["cookies"]) if result["status"] == "confirmed" else None
-    else:
-        result = creator_adapter.check_qrcode_status(session.qr_id, cookies)
-        account_sub_type = "creator"
-        user_info = creator_adapter.get_user_info(result["cookies"]) if result["status"] == "confirmed" else None
-    session.status = result["status"]
-    session.encrypted_temp_cookies = encrypt_text(
-        _dump_temp_state(result["cookies"], sync_creator=sync_creator)
-    )
+    # 并发轮询复用当前状态：不重复打上游（二维码只能消费一次）
+    lock = _session_lock(session.id)
+    if not lock.acquire(blocking=False):
+        return {
+            "session_id": session.id,
+            "status": session.status,
+            "qr_url": session.qr_url,
+            "account": None,
+            "creator_account": None,
+            "polling": True,
+        }
 
-    account_payload = None
-    creator_account_payload = None
-    if session.status == "confirmed":
+    try:
+        # A request may have loaded the row before the preceding poll committed.
+        db.refresh(session)
+        if session.status in {"confirmed", "expired", "blocked"}:
+            return _terminal_login_response(db, session)
+        return _poll_login_session(
+            session=session,
+            current_user=current_user,
+            db=db,
+            pc_adapter=pc_adapter,
+            creator_adapter=creator_adapter,
+        )
+    finally:
+        lock.release()
+
+
+def _stop_blocked_login(db: Session, session: LoginSession, error: XhsLoginBlockedError) -> dict:
+    session.status = "blocked"
+    session.encrypted_temp_cookies = encrypt_text(
+        _dump_temp_state({}, login_error=error.public_details())
+    )
+    db.commit()
+    logger.warning("XHS login stopped after HTTP 471 session=%s", session.id)
+    return _terminal_login_response(db, session)
+
+
+def _poll_login_session(
+    *,
+    session: LoginSession,
+    current_user: User,
+    db: Session,
+    pc_adapter: XhsPcLoginAdapter,
+    creator_adapter: XhsCreatorLoginAdapter,
+) -> dict:
+    try:
+        temp_state = decrypt_text(session.encrypted_temp_cookies)
+        cookies, sync_creator, exchanged = _load_temp_state(temp_state)
+        envelope = _load_json(temp_state)
+        login_state = envelope.get("login_state") if isinstance(envelope.get("cookies"), dict) else None
+    except InvalidToken:
+        # SECRET_KEY 变更或数据损坏：无法再解密上游 Cookie，只能让用户重扫
+        session.status = "expired"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="登录会话已失效（服务端密钥变更），请刷新二维码后重新扫码",
+        )
+
+    account_sub_type = "pc" if session.sub_type == "pc" else "creator"
+
+    # 已完成二维码换取、但上次获取账号信息失败：跳过换取，直接重试拿用户信息
+    if not exchanged:
+        try:
+            if session.sub_type == "pc":
+                if not session.code:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Unsupported login session",
+                    )
+                state_options = {"login_state": login_state} if login_state is not None else {}
+                result = pc_adapter.check_qrcode_status(session.qr_id, session.code, cookies, **state_options)
+            else:
+                result = creator_adapter.check_qrcode_status(session.qr_id, cookies)
+        except XhsLoginBlockedError as exc:
+            return _stop_blocked_login(db, session, exc)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            checkpoint = getattr(exc, "login_state", None)
+            if checkpoint is not None:
+                session.encrypted_temp_cookies = encrypt_text(
+                    _dump_temp_state(cookies, sync_creator=sync_creator, login_state=checkpoint)
+                )
+                db.commit()
+            logger.exception("XHS 二维码状态轮询失败 session=%s", session.id)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"小红书登录状态校验失败：{exc}。请稍后重试或刷新二维码",
+            ) from exc
+
+        status_value = result.get("status") or "pending"
+        cookies = result.get("cookies") or cookies
+        login_state = result.get("login_state", login_state)
+        # 换取成功后先记 scanned + exchanged（而不是直接 confirmed）：
+        # 若随后获取账号信息失败，下次轮询还能跳过换取继续重试，
+        # 否则会被“confirmed 直接返回”的分支挡住，永远拿不到账号。
+        session.status = "scanned" if status_value == "confirmed" else status_value
+        session.encrypted_temp_cookies = encrypt_text(
+            _dump_temp_state(
+                cookies,
+                sync_creator=sync_creator,
+                exchanged=status_value == "confirmed",
+                login_state=login_state,
+            )
+        )
+        db.commit()
+        if status_value != "confirmed":
+            return {
+                "session_id": session.id,
+                "status": session.status,
+                "qr_url": session.qr_url,
+                "account": None,
+                "creator_account": None,
+            }
+        db.refresh(session)
+    else:
+        # 上次已完成换取：跳过状态校验，直接续跑账号信息获取
+        pass
+
+    try:
+        state_options = {"login_state": login_state} if login_state is not None else {}
+        user_info = (
+            pc_adapter.get_user_info(cookies, **state_options)
+            if account_sub_type == "pc"
+            else creator_adapter.get_user_info(cookies)
+        )
+        login_state = user_info.pop("login_state", login_state)
+    except XhsLoginBlockedError as exc:
+        return _stop_blocked_login(db, session, exc)
+    except Exception as exc:
+        checkpoint = getattr(exc, "login_state", None)
+        if checkpoint is not None:
+            session.encrypted_temp_cookies = encrypt_text(
+                _dump_temp_state(cookies, sync_creator=sync_creator, exchanged=True, login_state=checkpoint)
+            )
+            db.commit()
+        logger.exception("XHS 扫码已确认但获取账号信息失败 session=%s", session.id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"扫码已确认，但获取账号信息失败：{exc}。请稍等重试（无需重新扫码）",
+        ) from exc
+
+    try:
         account, action = _create_account_from_login(
             db=db,
             user_id=current_user.id,
             sub_type=account_sub_type,
             user_info=user_info,
-            cookies=result["cookies"],
+            cookies=cookies,
         )
         account_payload = serialize_account(account, action)
+        creator_account_payload = None
         if account_sub_type == "pc" and sync_creator:
             creator_account_payload = _sync_creator_account_from_pc_login(
                 db=db,
                 user_id=current_user.id,
-                pc_cookies=result["cookies"],
+                pc_cookies=cookies,
                 creator_adapter=creator_adapter,
             )
+        # Keep the completed result for retries if the first response is lost.
+        session.encrypted_temp_cookies = encrypt_text(
+            _dump_temp_state(
+                cookies,
+                sync_creator=sync_creator,
+                exchanged=True,
+                account_id=account.id,
+                creator_account_id=creator_account_payload["id"] if creator_account_payload else None,
+            )
+        )
+        session.status = "confirmed"
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("XHS 登录账号保存失败 session=%s", session.id)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"账号信息保存失败：{exc}",
+        ) from exc
 
-    db.commit()
     return {
         "session_id": session.id,
         "status": session.status,
@@ -280,6 +537,7 @@ def pc_phone_send_code(
         result = adapter.create_phone_session(payload.phone)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to send phone code") from exc
+    _expire_stale_sessions(db, user_id=current_user.id, sub_type="pc")
     session = LoginSession(
         user_id=current_user.id,
         platform="xhs",
@@ -319,6 +577,7 @@ def creator_phone_send_code(
         result = adapter.create_phone_session(payload.phone)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to send phone code") from exc
+    _expire_stale_sessions(db, user_id=current_user.id, sub_type="creator")
     session = LoginSession(
         user_id=current_user.id,
         platform="xhs",
@@ -361,11 +620,17 @@ def _confirm_phone_login(
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Login session not found")
     try:
-        cookies, stored_sync_creator = _load_temp_state(decrypt_text(session.encrypted_temp_cookies))
+        cookies, stored_sync_creator, _exchanged = _load_temp_state(
+            decrypt_text(session.encrypted_temp_cookies)
+        )
         result = adapter.confirm_phone_login(payload.phone, payload.code, cookies)
         user_info = adapter.get_user_info(result["cookies"])
     except Exception as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Phone login failed") from exc
+        logger.exception("XHS 手机验证码登录失败 session=%s", session.id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"手机验证码登录失败：{exc}",
+        ) from exc
 
     sync_creator = payload.sync_creator if payload.sync_creator is not None else stored_sync_creator
     session.status = "confirmed"

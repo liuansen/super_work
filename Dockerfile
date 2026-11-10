@@ -40,13 +40,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js runtime (required for JS signature execution)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# 从官方镜像拷贝固定版本 Node（避免 curl | bash 执行远端脚本的供应链风险）
+COPY --from=node:20-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+COPY --from=node:20-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && node --version && npm --version
 
 # Install Python dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# requirements-douyin.txt 提供抖音集成所需的 protobuf>=5.27 等依赖；
+# 缺失时 RealDouyinAdapter 在容器内会因 ModuleNotFoundError 全部失效。
+COPY requirements.txt requirements-douyin.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -r requirements-douyin.txt
 
 # Copy project source
 COPY . .
@@ -57,8 +61,12 @@ COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 # Install root-level Node.js deps (signature JS execution)
 RUN if [ -f package.json ]; then npm install --no-audit --no-fund --omit=dev; fi
 
-# Create data directory for SQLite and storage
-RUN mkdir -p /app/data /app/backend/app/storage/media /app/backend/app/storage/exports
+# Create data directory for SQLite and storage, and run as non-root
+RUN mkdir -p /app/data /app/backend/app/storage/media /app/backend/app/storage/exports \
+    && groupadd --system app \
+    && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
+    && chown -R app:app /app
+USER app
 
 # Set environment defaults
 ENV PYTHONUNBUFFERED=1 \

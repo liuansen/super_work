@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import random
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -364,16 +367,15 @@ def run_auto_task(
 
     # 5b. Title rewrite (non-fatal)
     try:
-        rewritten_title = text_client._complete(
+        draft.title = text_client.rewrite_title(
             model_config=model_config,
             api_key=api_key,
-            system_prompt="你是小红书标题创作专家。",
-            user_prompt=f"为以下小红书笔记改写一个吸引人的标题（15字以内）：\n\n原标题：{draft.title}\n\n正文：{draft.body[:200]}",
-            temperature=0.8,
+            title=draft.title,
+            body=draft.body,
+            max_length=15,
         )
-        draft.title = rewritten_title.strip().strip('"').strip("'").strip("《》")
-    except Exception:
-        pass  # title rewrite failure is not fatal
+    except Exception as exc:
+        logger.warning(f"Auto task {auto_task.id} title rewrite failed: {exc}")
 
     tracking_task.progress = 80
     db.flush()
@@ -404,8 +406,9 @@ def run_auto_task(
                     upload_status="pending",
                 ))
 
-    # 7. Update auto task counters
-    auto_task.total_published = (auto_task.total_published or 0) + 1
+    # 7. Update auto task run time.
+    # 注意：此处仅创建了 pending 的 PublishJob，真实发布尚未发生（也不保证成功），
+    # total_published 由真正发布成功的调度链路递增，不在创建时计数。
     auto_task.last_run_at = shanghai_now()
     _calculate_next_run_at(auto_task)
 

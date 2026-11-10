@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
+from backend.app.api.auth import MEDIA_COOKIE_NAME
 from backend.app.core.config import get_settings
+from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
+from backend.app.core.security import decode_token
 from backend.app.models import User
 from backend.app.services.image_util import compose_cover_image, resize_image_file
 
@@ -146,9 +150,52 @@ def resize_image(payload: ResizeImageRequest, current_user: User = Depends(get_c
     return _serialize_media_file(file_name=file_name, width=payload.width, height=payload.height)
 
 
+def _media_viewer_user(
+    authorization: Optional[str] = Header(default=None),
+    media_token: Optional[str] = Cookie(default=None, alias=MEDIA_COOKIE_NAME),
+    db: Session = Depends(get_db),
+) -> User:
+    """媒体读取鉴权：支持 Authorization 头（access token）或 media_token cookie。
+
+    ``<img>`` 标签无法携带 Authorization 头，因此登录/刷新时会下发
+    HttpOnly 的 media_token cookie；两种凭证任一有效即可。
+    """
+    credentials_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
+    )
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        try:
+            payload = decode_token(token)
+        except HTTPException:
+            payload = None
+        if payload and payload.get("token_type") == "access":
+            user = db.get(User, payload["user_id"])
+            if user is not None:
+                return user
+    if media_token:
+        try:
+            payload = decode_token(media_token)
+        except HTTPException:
+            payload = None
+        if payload and payload.get("token_type") == "media":
+            user = db.get(User, payload["user_id"])
+            if user is not None:
+                return user
+    raise credentials_error
+
+
 @router.get("/media/{file_name}")
-def download_media(file_name: str):
+def download_media(file_name: str, viewer: User = Depends(_media_viewer_user)):
     if Path(file_name).name != file_name or ".." in file_name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
+    # 属主校验：媒体文件名统一携带 xhs-*-u{user_id}- 前缀
+    owner_prefixes = (
+        f"xhs-image-u{viewer.id}-",
+        f"xhs-asset-u{viewer.id}-",
+        f"xhs-upload-u{viewer.id}-",
+    )
+    if not file_name.startswith(owner_prefixes):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
     file_path = _media_dir() / file_name
     if not file_path.is_file():
@@ -185,9 +232,15 @@ async def upload_file(file: UploadFile, current_user: User = Depends(get_current
     if ext not in ALLOWED_UPLOAD_EXTENSIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"不支持的文件格式: {ext}")
 
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件大小超过 100MB 限制")
+    # 分块读取，超限即中止，避免恶意大文件先整读进内存
+    content = bytearray()
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        content.extend(chunk)
+        if len(content) > MAX_UPLOAD_SIZE:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件大小超过 100MB 限制")
 
     asset_type = "video" if ext in {".mp4", ".mov", ".avi", ".mkv"} else "image"
     file_name = f"xhs-upload-u{current_user.id}-{uuid4().hex}{ext}"

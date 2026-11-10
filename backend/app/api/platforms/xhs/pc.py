@@ -14,7 +14,6 @@ from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.models import AccountCookieVersion, PlatformAccount, User
-from backend.app.services.mock_data import sample_notes
 
 router = APIRouter(prefix="/xhs/pc", tags=["xhs-pc"])
 
@@ -339,11 +338,6 @@ def search_notes(
     }
 
 
-@router.post("/search/users")
-def search_users():
-    return {"total": 1, "items": [{"id": "demo-user", "nickname": "运营研究员"}]}
-
-
 @router.post("/notes/detail")
 def note_detail(
     payload: NoteDetailRequest,
@@ -379,20 +373,5 @@ def note_comments(
     return {"total": len(items), "items": items}
 
 
-def note_comments_placeholder():
-    return {"total": 1, "items": [{"id": "comment-1", "content": "这个选题很有用"}]}
-
-
-@router.post("/users/notes")
-def user_notes():
-    return {"total": len(sample_notes()), "items": sample_notes()}
-
-
-@router.get("/homefeed/channels")
-def homefeed_channels():
-    return {"items": [{"id": "homefeed_recommend", "name": "推荐"}]}
-
-
-@router.post("/homefeed/recommend")
-def homefeed_recommend():
-    return {"items": sample_notes()}
+# 说明：原 /search/users、/users/notes、/homefeed/* 等端点返回写死的示例数据且
+# 未做鉴权，已移除；前端未使用这些路由。真实能力请走 search / notes 接口。

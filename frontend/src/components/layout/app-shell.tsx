@@ -47,6 +47,7 @@ import KeepAliveRouteOutlet from "keepalive-for-react-router";
 import { useAuth } from "../../hooks/use-auth";
 import { useThemeMode } from "../../app/providers";
 import { fetchNotifications, markAllNotificationsRead, markNotificationRead } from "../../lib/api";
+import { formatShanghaiTime } from "../../lib/time";
 import type { AppNotification } from "../../types";
 
 const { Sider, Header, Content } = Layout;
@@ -125,7 +126,7 @@ export function AppShell() {
                 <List.Item.Meta
                   avatar={<span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: levelColor(n.level), marginTop: 6 }} />}
                   title={<Text style={{ fontSize: 13 }}>{n.title}</Text>}
-                  description={<div>{n.body && <Text type="secondary" style={{ fontSize: 12, display: "block" }}>{n.body}</Text>}<Text type="secondary" style={{ fontSize: 11 }}>{new Date(n.created_at).toLocaleString("zh-CN")}</Text></div>}
+                  description={<div>{n.body && <Text type="secondary" style={{ fontSize: 12, display: "block" }}>{n.body}</Text>}<Text type="secondary" style={{ fontSize: 11 }}>{formatShanghaiTime(n.created_at)}</Text></div>}
                 />
               </List.Item>
             )}

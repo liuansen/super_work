@@ -7,6 +7,7 @@ import { createXhsCreatorQrLoginSession, createXhsPcQrLoginSession, pollXhsLogin
 import type { PlatformAccount, XhsQrLoginSession } from "../../types";
 
 const { Text, Link: AntLink } = Typography;
+const blockedMessage = "小红书拒绝了本次登录请求，已停止自动重试。请先在小红书官方网页或 App 确认可正常登录，并完成平台提示的验证，再重新绑定。";
 
 type QrLoginPanelProps = {
   accountType: "pc" | "creator";
@@ -20,20 +21,26 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [syncCreator, setSyncCreator] = useState(false);
   const confirmedRef = useRef(false);
+  const onConfirmedRef = useRef(onConfirmed);
 
-  function errorMessage(error: unknown): string {
+  useEffect(() => {
+    onConfirmedRef.current = onConfirmed;
+  }, [onConfirmed]);
+
+  function errorMessage(error: unknown, fallback = "二维码生成失败，请稍后重试。"): string {
     if (axios.isAxiosError(error)) {
       const detail = error.response?.data?.detail;
       if (typeof detail === "string" && detail) {
         return detail;
       }
     }
-    return "二维码生成失败，请稍后重试。";
+    return fallback;
   }
 
   async function startSession() {
     setIsLoading(true);
     setError(null);
+    setSession(null);
     confirmedRef.current = false;
     try {
       const nextSession =
@@ -49,38 +56,83 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
     }
   }
 
+  // 记录已为哪组参数创建过会话：React StrictMode 会双调用 effect，
+  // 不加守卫会在挂载瞬间连建两个上游会话（数据库里成对出现）
+  const startedKeyRef = useRef<string | null>(null);
   useEffect(() => {
+    const key = `${accountType}:${syncCreator}`;
+    if (startedKeyRef.current === key) {
+      return;
+    }
+    // 切换账号类型或勾选“同步 Creator”会重建 session。
+    // 已有二维码时给出明确提示，避免用户正扫的码被静默作废。
+    if (startedKeyRef.current !== null) {
+      setStatusText("参数已变更，正在重新生成二维码…");
+    }
+    startedKeyRef.current = key;
     void startSession();
+    // startSession 依赖 accountType/syncCreator，二者变化即重建
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountType, syncCreator]);
 
   useEffect(() => {
-    if (!session?.session_id || session.status === "confirmed" || session.status === "expired") {
+    if (!session?.session_id || session.status === "confirmed" || session.status === "expired" || session.status === "blocked") {
       return;
     }
 
-    const interval = window.setInterval(async () => {
+    let cancelled = false;
+    let terminal = false;
+    let timer: number | undefined;
+    const sessionId = session.session_id;
+
+    // 串行轮询（setTimeout 链）：单次上游请求可能超过 2s，
+    // setInterval 会让请求重叠；后端虽已串行化，前端也不应堆积请求。
+    const poll = async () => {
+      if (cancelled) return;
       try {
-        const polled = await pollXhsLoginSession(session.session_id);
+        const polled = await pollXhsLoginSession(sessionId);
+        if (cancelled) return;
+        terminal = polled.status === "confirmed" || polled.status === "expired" || polled.status === "blocked";
+        setError(null);
         setSession((current) => ({
           ...polled,
           qr_image_data_url: polled.qr_image_data_url ?? current?.qr_image_data_url
         }));
         if (polled.status === "scanned") {
           setStatusText("已扫码，请在手机端确认登录");
+          setError(null);
+        } else if (polled.status === "blocked") {
+          setStatusText("登录请求被小红书拒绝，已停止自动重试");
         } else if (polled.status === "expired") {
           setStatusText("二维码已过期，请刷新");
-        } else if (polled.status === "confirmed" && polled.account && !confirmedRef.current) {
-          confirmedRef.current = true;
-          setStatusText("账号绑定成功");
-          onConfirmed(polled.account);
+        } else if (polled.status === "confirmed") {
+          if (polled.account && !confirmedRef.current) {
+            confirmedRef.current = true;
+            setStatusText("账号绑定成功");
+            onConfirmedRef.current(polled.account);
+          } else if (!polled.account) {
+            // 已确认但账号信息还在重试（后端幂等续跑）
+            setStatusText("已确认登录，正在获取账号信息…");
+          }
         }
-      } catch {
-        setError("轮询登录状态失败，正在等待下一次尝试。");
+      } catch (caught) {
+        if (cancelled) return;
+        // 展示后端返回的具体原因（如上游换取失败、会话失效），
+        // 而不是笼统的“轮询失败”
+        setError(errorMessage(caught, "轮询登录状态失败，正在等待下一次尝试。"));
+      } finally {
+        if (!cancelled && !terminal) {
+          timer = window.setTimeout(() => void poll(), 2000);
+        }
       }
-    }, 2000);
+    };
 
-    return () => window.clearInterval(interval);
-  }, [accountType, onConfirmed, session?.session_id, session?.status]);
+    timer = window.setTimeout(() => void poll(), 2000);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [session?.session_id, session?.status]);
 
   return (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -142,6 +194,19 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
         >
           登录 PC 后同步 Creator 账号
         </Checkbox>
+      ) : null}
+
+      {session?.status === "blocked" ? (
+        <Alert
+          type="warning"
+          message={session.message || blockedMessage}
+          description={
+            <AntLink href="https://www.xiaohongshu.com/" target="_blank" rel="noreferrer">
+              打开小红书官方网页
+            </AntLink>
+          }
+          showIcon
+        />
       ) : null}
 
       {error ? <Alert type="error" message={error} showIcon /> : null}

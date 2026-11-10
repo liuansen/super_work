@@ -109,22 +109,29 @@ export function ModelConfigPage() {
     setIsSaving(true);
     setMessage(null);
     setError(null);
-    const payload = {
+    const apiKey = form.api_key.trim();
+    const basePayload: ModelConfigPayload = {
       ...form,
       name: form.name.trim(),
       model_name: form.model_name.trim(),
       provider: form.provider.trim(),
       base_url: form.base_url.trim(),
-      api_key: form.api_key.trim(),
+      api_key: apiKey,
     };
     try {
       if (editingId) {
-        const updated = await updateModelConfig(editingId, payload);
+        // 编辑模式密钥输入框留空 = 不修改 API Key（后端把空串视为“清空密钥”，
+        // 照常提交会导致改个名字就把密钥抹掉）
+        const updatePayload: Partial<ModelConfigPayload> = { ...basePayload };
+        if (!apiKey) {
+          delete updatePayload.api_key;
+        }
+        const updated = await updateModelConfig(editingId, updatePayload);
         setConfigs((current) => current.map((c) => c.id === updated.id ? updated : (updated.is_default && c.model_type === updated.model_type ? { ...c, is_default: false } : c)));
         setMessage(`${typeLabel(updated.model_type)}配置已更新。`);
         setEditingId(null);
       } else {
-        const created = await createModelConfig(payload);
+        const created = await createModelConfig(basePayload);
         setConfigs((current) => {
           const withoutOldDefault = created.is_default
             ? current.map((config) => config.model_type === created.model_type ? { ...config, is_default: false } : config)

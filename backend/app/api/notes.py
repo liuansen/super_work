@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from backend.app.api.platforms.xhs.pc import (
@@ -24,6 +24,7 @@ from backend.app.core.time import shanghai_now
 from backend.app.core.security import decrypt_text
 from backend.app.models import AccountCookieVersion, AiDraft, Note, NoteAsset, NoteComment, PlatformAccount, Tag, User, note_tags
 from backend.app.schemas.common import paginated
+from backend.app.services.export_cleanup import prune_user_exports
 
 router = APIRouter(prefix="/notes", tags=["notes"])
 
@@ -48,18 +49,21 @@ class BatchSaveNotesRequest(BaseModel):
 
 
 class BatchTagNotesRequest(BaseModel):
-    note_ids: list[int] = Field(min_length=1)
+    # 上限 500：防止单次导出全库导致内存/磁盘压力
+    note_ids: list[int] = Field(min_length=1, max_length=500)
     tag_ids: list[int] = Field(default_factory=list)
     mode: Literal["replace", "add", "remove"] = "replace"
 
 
 class BatchCreateDraftsRequest(BaseModel):
-    note_ids: list[int] = Field(min_length=1)
+    # 上限 500：防止单次导出全库导致内存/磁盘压力
+    note_ids: list[int] = Field(min_length=1, max_length=500)
     intent: str = Field(default="rewrite", max_length=32)
 
 
 class ExportNotesRequest(BaseModel):
-    note_ids: list[int] = Field(min_length=1)
+    # 上限 500：防止单次导出全库导致内存/磁盘压力
+    note_ids: list[int] = Field(min_length=1, max_length=500)
     format: Literal["json", "csv"] = "json"
 
 
@@ -265,8 +269,16 @@ def get_notes(
         statement = statement.where(Note.id.in_(select(NoteComment.note_id)))
     elif has_comments is False:
         statement = statement.where(Note.id.not_in(select(NoteComment.note_id)))
-    notes = db.scalars(statement.order_by(Note.created_at.desc())).all()
-    return paginated([_serialize_note_with_tags(db, note) for note in notes], page, page_size)
+    # SQL 层分页：此前全表加载后在内存切片，数据量增长后每次列表请求都是全表扫描
+    total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
+    pages = statement.order_by(Note.created_at.desc(), Note.id.desc())
+    notes = db.scalars(pages.offset((page - 1) * page_size).limit(page_size)).all()
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "items": [_serialize_note_with_tags(db, note) for note in notes],
+    }
 
 
 @router.post("/batch-create-drafts")
@@ -576,6 +588,8 @@ def export_notes(
             "items": [_serialize_note_with_tags(db, note) for note in notes],
         }
         file_path.write_text(json.dumps(export_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 每用户保留最近 10 个导出，避免磁盘只增不减
+    prune_user_exports(export_dir, current_user.id, "notes")
     return {
         "exported_count": len(notes),
         "file_name": file_name,

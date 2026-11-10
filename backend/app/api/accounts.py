@@ -209,9 +209,8 @@ def check_account(
     return serialize_account(account)
 
 
-@router.patch("/{account_id}")
-def update_account(account_id: int):
-    return {"id": account_id, "status": "updated"}
+# 说明：原 PATCH /{account_id} 是未鉴权的空壳实现（什么都不改却返回 updated），
+# 已移除；账号更新通过登录流程 / 健康检查接口完成。
 
 
 @router.delete("/{account_id}")

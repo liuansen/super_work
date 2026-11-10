@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
 from backend.app.core.database import get_db
+from backend.app.core.media_source import InvalidMediaSource, validate_media_source
+from backend.app.core.time import to_naive_shanghai
 from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.core.time import shanghai_now
@@ -31,10 +33,27 @@ class PublishJobUpdateRequest(BaseModel):
     privacy_type: Optional[int] = Field(default=None, ge=0, le=1)
     is_private: Optional[bool] = None
 
+    @field_validator("scheduled_at")
+    @classmethod
+    def _normalize_scheduled_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        # 前端可能提交带时区偏移的 ISO 时间，统一转为库内口径（naive 北京时间）
+        if value is not None:
+            value = to_naive_shanghai(value)
+        return value
+
 
 class PublishAssetCreateRequest(BaseModel):
     asset_type: str = Field(pattern="^(image|video)$")
     file_path: str = Field(min_length=1)
+
+    @field_validator("file_path")
+    @classmethod
+    def _validate_file_path(cls, value: str) -> str:
+        try:
+            validate_media_source(value)
+        except InvalidMediaSource as exc:
+            raise ValueError(str(exc)) from exc
+        return value
 
 
 def get_creator_publish_adapter_factory():
@@ -181,7 +200,9 @@ def _scheduled_post_time(job: PublishJob) -> Optional[int]:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scheduled publish time is required")
     if job.scheduled_at <= shanghai_now():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scheduled publish time must be in the future")
-    return int(job.scheduled_at.timestamp() * 1000)
+    # scheduled_at 为 naive 北京时间；显式挂 +08:00 再取时间戳，避免按服务器本地时区解释
+    beijing = timezone(timedelta(hours=8))
+    return int(job.scheduled_at.replace(tzinfo=beijing).timestamp() * 1000)
 
 
 def _asset_creator_upload_info(asset: PublishAsset) -> dict[str, Any]:
@@ -452,8 +473,8 @@ def publish_job_to_creator(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
     if account.platform != "xhs" or account.sub_type != "creator":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creator account required")
-    if job.status in {"publishing", "published", "scheduled"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Publish job is already completed")
+    if job.status in {"publishing", "uploading", "published", "scheduled"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Publish job is already completed or in progress")
     if not job.title.strip():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Publish title is required")
     if job.publish_mode == "scheduled":
@@ -462,10 +483,28 @@ def publish_job_to_creator(
         if job.scheduled_at <= shanghai_now():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scheduled publish time must be in the future")
 
+    # 原子领取：条件 UPDATE 抢占，防止与调度器 / run-due 并发时重复发布
+    claimed = db.execute(
+        update(PublishJob)
+        .where(
+            PublishJob.id == job.id,
+            PublishJob.status.not_in(("publishing", "uploading", "published", "scheduled")),
+        )
+        .values(status="publishing", publish_error="", publish_started_at=shanghai_now())
+    )
+    db.commit()
+    if claimed.rowcount != 1:
+        db.refresh(job)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publish job is already completed or in progress")
+    db.refresh(job)
+
     assets = db.scalars(
         select(PublishAsset).where(PublishAsset.publish_job_id == job.id).order_by(PublishAsset.id.asc())
     ).all()
     if not assets:
+        job.status = "failed"
+        job.publish_error = "至少需要一个素材"
+        db.commit()
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="至少需要一个素材")
 
     cookies = _get_latest_account_cookies(db, account.id)
@@ -482,6 +521,8 @@ def publish_job_to_creator(
             except Exception as exc:
                 asset.upload_status = "failed"
                 asset.upload_error = str(exc)[:500]
+                job.status = "failed"
+                job.publish_error = f"素材上传失败: {exc}"[:500]
                 db.commit()
                 raise HTTPException(
                     status_code=status.HTTP_502_BAD_GATEWAY,
@@ -524,8 +565,6 @@ def publish_job_to_creator(
         },
     )
     db.add(task)
-    job.status = "publishing"
-    job.publish_error = ""
     db.commit()
 
     try:
@@ -545,11 +584,15 @@ def publish_job_to_creator(
         db.refresh(job)
         return serialize_publish_job(job)
     except Exception as exc:
+        db.rollback()
+        job = _get_owned_publish_job(db, current_user, job.id)
+        task = db.get(Task, task.id)
         job.status = "failed"
-        job.publish_error = str(exc)
-        task.status = "failed"
-        task.progress = 100
-        task.payload = {**(task.payload or {}), "error": str(exc)}
+        job.publish_error = str(exc)[:500]
+        if task is not None:
+            task.status = "failed"
+            task.progress = 100
+            task.payload = {**(task.payload or {}), "error": str(exc)[:500]}
         db.commit()
         db.refresh(job)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=job.publish_error)

@@ -6,10 +6,14 @@ from threading import Lock
 
 from backend.app.core.config import get_settings
 
+# 默认每账号抓取限速（次/分钟）。注意：scheduler_interval_seconds 是
+# “调度间隔（秒）”，单位不同，不能作为每分钟次数的兜底值。
+DEFAULT_CRAWL_PER_MINUTE = 5
+
 
 class CrawlRateLimiter:
     def __init__(self, max_per_minute: int | None = None):
-        self._max = max_per_minute or get_settings().scheduler_interval_seconds or 5
+        self._max = max_per_minute or DEFAULT_CRAWL_PER_MINUTE
         self._lock = Lock()
         self._windows: dict[int, list[float]] = defaultdict(list)
 
@@ -37,10 +41,14 @@ class CrawlRateLimiter:
 
 
 _global_limiter: CrawlRateLimiter | None = None
+_global_limiter_lock = Lock()
 
 
 def get_rate_limiter() -> CrawlRateLimiter:
+    """线程安全的懒初始化：FastAPI 线程池与调度器线程并发调用。"""
     global _global_limiter
     if _global_limiter is None:
-        _global_limiter = CrawlRateLimiter(max_per_minute=5)
+        with _global_limiter_lock:
+            if _global_limiter is None:
+                _global_limiter = CrawlRateLimiter(max_per_minute=DEFAULT_CRAWL_PER_MINUTE)
     return _global_limiter

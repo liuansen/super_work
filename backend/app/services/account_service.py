@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from backend.app.core.security import encrypt_text
@@ -129,6 +129,22 @@ def upsert_platform_account_from_login(
                 PlatformAccount.sub_type == sub_type,
                 PlatformAccount.external_user_id == external_user_id,
             )
+        )
+    else:
+        # 上游未返回 external_user_id 时，复用该用户同平台同类型中最近一个
+        # “无外部 ID”的账号，避免同一账号每次登录都插入新行导致账号列表膨胀
+        account = db.scalar(
+            select(PlatformAccount)
+            .where(
+                PlatformAccount.user_id == user_id,
+                PlatformAccount.platform == platform,
+                PlatformAccount.sub_type == sub_type,
+                or_(
+                    PlatformAccount.external_user_id == "",
+                    PlatformAccount.external_user_id.is_(None),
+                ),
+            )
+            .order_by(PlatformAccount.id.desc())
         )
 
     action = "updated" if account is not None else "created"

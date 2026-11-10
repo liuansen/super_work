@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import select
@@ -148,5 +147,5 @@ def snapshot_to_dict(snapshot: WorkSnapshot) -> dict:
             "share_count": snapshot.stats.share_count,
             "collect_count": snapshot.stats.collect_count,
         },
-        "collected_at": datetime.now().isoformat(timespec="seconds"),
+        "collected_at": shanghai_now().isoformat(timespec="seconds"),
     }

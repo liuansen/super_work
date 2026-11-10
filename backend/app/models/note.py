@@ -22,7 +22,7 @@ class Note(Base):
     __tablename__ = "notes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, default=0)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     platform_account_id: Mapped[int] = mapped_column(ForeignKey("platform_accounts.id"), index=True)
     platform: Mapped[str] = mapped_column(String(32), index=True)
     note_id: Mapped[str] = mapped_column(String(128), index=True)

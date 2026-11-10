@@ -13,6 +13,7 @@ from typing import Any, Optional
 from backend.app.douyin import upstream
 from backend.app.douyin.contracts import (
     AccountIdentity,
+    DouyinAdapterError,
     DouyinAuthError,
     DouyinNetworkError,
     DouyinUpstreamError,

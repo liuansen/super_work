@@ -5,12 +5,18 @@ from datetime import datetime
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.core.database import get_db
+from backend.app.core.media_source import (
+    InvalidMediaSource,
+    validate_media_file_name,
+    validate_media_source,
+)
+from backend.app.core.time import to_naive_shanghai
 from backend.app.core.deps import get_current_user
 from backend.app.models import AiDraft, DraftAsset, Note, NoteAsset, PlatformAccount, PublishAsset, PublishJob, User
 from backend.app.schemas.common import paginated
@@ -40,6 +46,14 @@ class DraftSendToPublishRequest(BaseModel):
     location: Optional[str] = None
     privacy_type: Optional[int] = Field(default=None, ge=0, le=1)
     is_private: Optional[bool] = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _normalize_scheduled_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        # 统一转为库内口径（naive 北京时间），浏览器本地时区的时间由前端负责带偏移提交
+        if value is not None:
+            value = to_naive_shanghai(value)
+        return value
 
 
 def _clean_topics(topics: Optional[list[str]]) -> list[str]:
@@ -298,6 +312,26 @@ class DraftAssetCreateRequest(BaseModel):
     url: str = Field(default="", max_length=2048)
     local_path: str = Field(default="", max_length=512)
 
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: str) -> str:
+        if value and value.strip():
+            try:
+                validate_media_source(value)
+            except InvalidMediaSource as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
+    @field_validator("local_path")
+    @classmethod
+    def _validate_local_path(cls, value: str) -> str:
+        if value and value.strip():
+            try:
+                validate_media_file_name(value)
+            except InvalidMediaSource as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
 
 class DraftAssetReorderRequest(BaseModel):
     asset_ids: list[int] = Field(min_length=1)
@@ -363,6 +397,26 @@ def delete_draft_asset(
 class DraftAssetUpdateRequest(BaseModel):
     url: Optional[str] = Field(default=None, max_length=2048)
     local_path: Optional[str] = Field(default=None, max_length=512)
+
+    @field_validator("url")
+    @classmethod
+    def _validate_url(cls, value: Optional[str]) -> Optional[str]:
+        if value and value.strip():
+            try:
+                validate_media_source(value)
+            except InvalidMediaSource as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
+    @field_validator("local_path")
+    @classmethod
+    def _validate_local_path(cls, value: Optional[str]) -> Optional[str]:
+        if value and value.strip():
+            try:
+                validate_media_file_name(value)
+            except InvalidMediaSource as exc:
+                raise ValueError(str(exc)) from exc
+        return value
 
 
 @router.patch("/{draft_id}/assets/{asset_id}")

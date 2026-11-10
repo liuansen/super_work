@@ -36,6 +36,11 @@ def verify_password(password: str, password_hash: str) -> bool:
     return secrets.compare_digest(legacy_hash, password_hash)
 
 
+def is_legacy_password_hash(password_hash: str) -> bool:
+    """检测无盐 SHA-256 旧格式哈希，登录成功后应升级为 pbkdf2。"""
+    return not password_hash.startswith("pbkdf2_sha256$")
+
+
 def _base64url_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).decode("utf-8").rstrip("=")
 
@@ -69,6 +74,16 @@ def create_access_token(user_id: int) -> str:
 
 def create_refresh_token(user_id: int) -> str:
     return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "refresh")
+
+
+def create_media_token(user_id: int) -> str:
+    """媒体文件读取专用 token。
+
+    前端 ``<img>`` 标签无法携带 Authorization 头，登录/刷新时通过
+    HttpOnly cookie 下发该 token，用于 ``GET /api/files/media/`` 鉴权。
+    有效期与 refresh token 对齐。
+    """
+    return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "media")
 
 
 def decode_token(token: str) -> dict:

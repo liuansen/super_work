@@ -11,7 +11,7 @@ import {
 } from "@ant-design/icons";
 import { Alert, Button, Card, Checkbox, Col, Empty, Form, Input, InputNumber, Row, Select, Space, Spin, Table, Tag, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
 import { crawlXhsDataStream, fetchAccounts } from "../../../lib/api";
@@ -177,6 +177,7 @@ export function XhsCrawlerPage() {
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
   const [isLoadingAccounts, setIsLoadingAccounts] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
+  const runAbortRef = useRef<AbortController | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const pcAccounts = useMemo(() => accounts.filter((a) => a.platform === "xhs" && a.sub_type === "pc"), [accounts]);
@@ -205,21 +206,35 @@ export function XhsCrawlerPage() {
     setSuccessCount(0);
     setFailedCount(0);
     setProgressMsg(null);
+    const controller = new AbortController();
+    runAbortRef.current = controller;
     try {
       const summary = await crawlXhsDataStream(
         { account_id: selectedAccountId, mode, urls: parsedUrls, keyword: keyword.trim(), pages, max_notes: maxNotes, time_sleep: timeSleep, fetch_comments: mode === "comments" ? false : fetchCommentsChecked, ...filters, geo: filters.geo.trim() },
         (index, item) => { setItems((prev) => [...prev, item]); },
         (msg) => { setProgressMsg(msg); },
         (msg) => { setError(msg); },
+        controller.signal,
       );
       setSuccessCount(summary.success_count);
       setFailedCount(summary.failed_count);
       setProgressMsg(null);
     } catch (err: unknown) {
-      const axiosErr = err as { message?: string };
-      setError(axiosErr?.message || "抓取失败");
+      if (controller.signal.aborted) {
+        setProgressMsg("抓取已取消");
+      } else {
+        const axiosErr = err as { message?: string };
+        setError(axiosErr?.message || "抓取失败");
+      }
     }
-    finally { setIsRunning(false); }
+    finally {
+      runAbortRef.current = null;
+      setIsRunning(false);
+    }
+  }
+
+  function handleCancelRun() {
+    runAbortRef.current?.abort();
   }
 
   useEffect(() => { void loadAccounts(); }, []);
@@ -294,6 +309,7 @@ export function XhsCrawlerPage() {
             <Button type="primary" htmlType="submit" loading={isRunning} disabled={noPcAccount} icon={mode === "search" ? <SearchOutlined /> : <CloudDownloadOutlined />}>
               {isRunning ? "抓取中..." : "开始抓取"}
             </Button>
+            {isRunning && <Button danger onClick={handleCancelRun}>取消抓取</Button>}
             <Button icon={<FileExcelOutlined />} onClick={() => items.length && exportRowsToExcel(items)} disabled={!items.length}>导出 Excel</Button>
           </Space>
         </Form>

@@ -433,7 +433,7 @@ export function XhsImageStudioPage() {
                 value={imageUrl}
                 onChange={(e) => setImageUrl(e.target.value)}
                 placeholder="图片 URL"
-                disabled={isGenerating}
+                disabled={isDescribing}
               />
               <Button
                 icon={<PictureOutlined />}

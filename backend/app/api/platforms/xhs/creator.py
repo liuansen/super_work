@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,9 @@ from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
 from backend.app.api.tasks import serialize_task
 from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
+from backend.app.core.media_source import InvalidMediaSource, validate_media_source
 from backend.app.core.security import decrypt_text
+from backend.app.core.time import to_naive_shanghai
 from backend.app.models import AccountCookieVersion, PlatformAccount, Task, User
 
 router = APIRouter(prefix="/xhs/creator", tags=["xhs-creator"])
@@ -29,6 +31,15 @@ class CreatorUploadRequest(BaseModel):
     file_path: str = Field(min_length=1)
     media_type: Literal["image", "video"] = "image"
 
+    @field_validator("file_path")
+    @classmethod
+    def _validate_file_path(cls, value: str) -> str:
+        try:
+            validate_media_source(value)
+        except InvalidMediaSource as exc:
+            raise ValueError(str(exc)) from exc
+        return value
+
 
 class CreatorImagePublishRequest(BaseModel):
     account_id: int
@@ -42,6 +53,13 @@ class CreatorImagePublishRequest(BaseModel):
     privacy_type: Optional[int] = Field(default=None, ge=0, le=1)
     is_private: Optional[bool] = None
 
+    @field_validator("scheduled_at")
+    @classmethod
+    def _normalize_scheduled_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is not None:
+            value = to_naive_shanghai(value)
+        return value
+
 
 class CreatorVideoPublishRequest(BaseModel):
     account_id: int
@@ -54,6 +72,13 @@ class CreatorVideoPublishRequest(BaseModel):
     location: Optional[str] = None
     privacy_type: Optional[int] = Field(default=None, ge=0, le=1)
     is_private: Optional[bool] = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _normalize_scheduled_at(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is not None:
+            value = to_naive_shanghai(value)
+        return value
 
 
 def get_creator_api_adapter_factory():
@@ -158,7 +183,10 @@ def _scheduled_post_time(publish_mode: str, scheduled_at: Optional[datetime]) ->
         return None
     if scheduled_at is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Scheduled publish time is required")
-    return int(scheduled_at.timestamp() * 1000)
+    # scheduled_at 统一为 naive 北京时间；显式挂上 +08:00 再取时间戳，
+    # 避免 .timestamp() 按服务器本地时区解释
+    beijing = timezone(timedelta(hours=8))
+    return int(scheduled_at.replace(tzinfo=beijing).timestamp() * 1000)
 
 
 def _clean_topics(topics: Optional[list[str]]) -> list[str]:

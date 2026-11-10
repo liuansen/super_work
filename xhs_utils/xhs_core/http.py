@@ -86,17 +86,21 @@ class BrowserHttpClient:
         impersonate: str = DEFAULT_IMPERSONATE,
         accept_encoding: str = DEFAULT_ACCEPT_ENCODING,
         http_version: str = DEFAULT_HTTP_VERSION,
+        trust_env: bool = False,
     ) -> None:
         self.proxies = proxies
         self.impersonate = str(impersonate)
         self.accept_encoding = str(accept_encoding)
         self.http_version = str(http_version)
+        # 默认不继承 HTTP_PROXY/HTTPS_PROXY 环境变量：调用方要代理必须显式传
+        # proxies。这样无需在运行时全局篡改 os.environ（那会波及其他线程）。
         self.session = curl_requests.Session(
             proxies=proxies,
             impersonate=self.impersonate,
             default_headers=False,
             discard_cookies=True,
             http_version=self.http_version,
+            trust_env=trust_env,
         )
 
     def request(

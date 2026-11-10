@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Protocol
 
 import requests
 
 from backend.app.models import ModelConfig
+
+# 匹配“1. / 1、 / 1- / 1) / （1）”等序号前缀（str.strip(chars) 会误删标题两端的数字）
+_ORDERED_LIST_PREFIX_RE = re.compile(r"^\s*(?:[（(]?\d{1,3}[.、\-)）]|[•·]\s*|[-*]\s+)+\s*")
 
 
 class TextAiClient(Protocol):
@@ -226,7 +230,31 @@ class OpenAICompatibleTextClient:
             system_prompt="你是小红书标题优化专家。",
             user_prompt=f"请给出 {count} 个小红书标题，每行一个。\n原标题：{title}\n正文：{body}",
         )
-        return [line.strip(" -0123456789.、") for line in content.splitlines() if line.strip()][:count]
+        titles = []
+        for line in content.splitlines():
+            cleaned = _ORDERED_LIST_PREFIX_RE.sub("", line).strip()
+            if cleaned:
+                titles.append(cleaned)
+        return titles[:count]
+
+    def rewrite_title(
+        self,
+        *,
+        model_config: ModelConfig,
+        api_key: str,
+        title: str,
+        body: str,
+        max_length: int = 15,
+    ) -> str:
+        """改写单个标题（auto task 使用，避免调用方触达私有 _complete）。"""
+        content = self._complete(
+            model_config=model_config,
+            api_key=api_key,
+            system_prompt="你是小红书标题创作专家。",
+            user_prompt=f"为以下小红书笔记改写一个吸引人的标题（{max_length}字以内）：\n\n原标题：{title}\n\n正文：{body[:200]}",
+            temperature=0.8,
+        )
+        return content.strip().strip('"').strip("'").strip("《》")
 
     def generate_tags(
         self,

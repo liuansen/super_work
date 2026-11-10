@@ -13,8 +13,10 @@ ROOT = Path(__file__).resolve().parent
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start the Spider_XHS product platform.")
-    parser.add_argument("--host", default="127.0.0.1", help="Backend host.")
-    parser.add_argument("--port", type=int, default=8000, help="Backend port.")
+    # host/port 默认 None：区分“用户显式传参”与“未传”，
+    # 避免显式 --host 127.0.0.1（恰为默认值）被配置的 server_host 静默覆盖
+    parser.add_argument("--host", default=None, help="Backend host (default: config server_host).")
+    parser.add_argument("--port", type=int, default=None, help="Backend port (default: config server_port).")
     parser.add_argument("--reload", action="store_true", help="Enable Uvicorn reload.")
     parser.add_argument("--with-frontend", action="store_true", help="Also start the frontend Vite dev server.")
     parser.add_argument("--frontend-port", type=int, default=5173, help="Frontend dev server port.")
@@ -48,19 +50,19 @@ def start_frontend(port: int) -> Optional[subprocess.Popen]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    # Resolve host/port: CLI args take precedence, then YAML/env config defaults
+    # Resolve host/port: CLI 显式参数 > YAML/env 配置 > 内置默认
     host = args.host
     port = args.port
     try:
         from backend.app.core.config import get_settings
         settings = get_settings()
-        # Use config values only when CLI args are at their defaults
-        if host == "127.0.0.1" and settings.server_host:
-            host = settings.server_host
-        if port == 8000 and settings.server_port:
-            port = settings.server_port
+        if host is None:
+            host = settings.server_host or "127.0.0.1"
+        if port is None:
+            port = settings.server_port or 8000
     except Exception:
-        pass
+        host = host or "127.0.0.1"
+        port = port or 8000
 
     frontend_process = start_frontend(args.frontend_port) if args.with_frontend else None
 
