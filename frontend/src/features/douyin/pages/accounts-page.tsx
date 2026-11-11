@@ -49,7 +49,7 @@ export function DouyinAccountsPage() {
   }, []);
 
   useEffect(() => {
-    void load();
+    void load().catch(() => {/* 失败提示已由统一拦截器处理 */});
   }, [load]);
 
   const submitCookie = async () => {
@@ -88,7 +88,7 @@ export function DouyinAccountsPage() {
   const remove = (account: DouyinAccount) => {
     Modal.confirm({
       title: "删除该抖音账号？",
-      content: "仅解除绑定与本地凭证，不影响平台侧账号。",
+      content: "解除绑定并删除本地加密凭证；参考作品保留。存在未完成的发布任务时需先取消才能删除。",
       okButtonProps: { danger: true },
       onOk: async () => {
         await deleteDouyinAccount(account.id);

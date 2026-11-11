@@ -19,6 +19,15 @@ def get_adapter() -> DouyinAdapter:
     cls = _ADAPTERS.get(name)
     if cls is None:
         raise ValueError(f"未知 DOUYIN_ADAPTER: {name}（可选 real|fake）")
+    if cls is FakeDouyinAdapter:
+        # review P2：fake 适配器会对任意输入返回“发布成功”+ 伪造的作品 ID。
+        # 误配到生产会让用户以为内容已发布，实际平台侧什么都没发生。
+        from backend.app.core.config import get_settings
+
+        if get_settings().environment == "production":
+            raise RuntimeError(
+                "生产环境禁止使用 DOUYIN_ADAPTER=fake（会伪造发布成功）"
+            )
     return cls()
 
 

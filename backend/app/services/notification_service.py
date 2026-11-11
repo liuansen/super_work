@@ -46,12 +46,19 @@ def notify_account_expired(db: Session, user_id: int, account_name: str, account
     )
 
 
-def notify_publish_failed(db: Session, user_id: int, job_title: str, job_id: int, task_id: Optional[int] = None) -> Notification:
+def notify_publish_failed(
+    db: Session,
+    user_id: int,
+    job_title: str,
+    job_id: int,
+    task_id: Optional[int] = None,
+    error: str = "",
+) -> Notification:
     return _create(
         db,
         user_id=user_id,
         title=f"发布失败: {job_title}",
-        body="",
+        body=(error or "")[:500],
         level="warning",
         source_task_id=task_id,
         source_type="publish_job",

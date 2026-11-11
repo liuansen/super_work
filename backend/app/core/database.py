@@ -12,14 +12,20 @@ class Base(DeclarativeBase):
 
 settings = get_settings()
 
-_connect_args = {}
+_connect_args: dict = {}
+_engine_kwargs: dict = {}
 if settings.database_url.startswith("sqlite"):
     _connect_args["check_same_thread"] = False
     import os
     db_path = settings.database_url.replace("sqlite:///", "")
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+else:
+    # review P2：MySQL 默认 wait_timeout 8h，SQLAlchemy 默认不复检也不回收，
+    # 池中空闲连接被服务端断开后首个复用请求会抛 "MySQL server has gone away"。
+    # 线程池 + 调度器线程共享连接池，需要比默认 5+10 更大的容量。
+    _engine_kwargs.update(pool_pre_ping=True, pool_recycle=1800, pool_size=10, max_overflow=20)
 
-engine = create_engine(settings.database_url, connect_args=_connect_args)
+engine = create_engine(settings.database_url, connect_args=_connect_args, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -67,6 +73,9 @@ def _run_alembic_migrations() -> None:
 
         alembic_cfg = Config(ini_path)
         alembic_cfg.set_main_option("sqlalchemy.url", settings.database_url)
+        # 应用内嵌迁移不要应用 alembic.ini 的 logging 配置：
+        # 它会把 root logger 重置为 WARN 并换掉 handler，导致应用日志被静默
+        alembic_cfg.attributes["skip_logging_config"] = True
 
         # 多 worker（uvicorn --workers N）并发启动时，避免多个进程同时跑迁移
         lock_path = os.path.join(os.path.dirname(ini_path), ".alembic-migrate.lock")
@@ -87,12 +96,22 @@ def _run_alembic_migrations() -> None:
             has_alembic = "alembic_version" in inspector.get_table_names()
 
             if has_tables and not has_alembic:
-                # 旧版 create_all 建的库：盖戳到 head 意味着假设 schema 与 head 一致，
-                # 若是更老版本升级而来可能缺表，只能靠后续报错暴露。
-                logger.warning(
-                    "检测到无 alembic 版本记录的存量数据库，已 stamp 到 head。"
-                    "如运行时报缺表，请手动执行 alembic stamp <旧版本> && alembic upgrade head。"
-                )
+                # DB-2（P1-19）：不再盲目 stamp head——只有当库内 schema 与当前
+                # 模型完全一致时才盖戳；否则明确报错要求人工确认版本，
+                # 避免把旧库永久跳过迁移、后续以 no such column 暴露。
+                from alembic.migration import MigrationContext
+                from alembic.autogenerate import compare_metadata
+
+                migration_context = MigrationContext.configure(engine)
+                diffs = compare_metadata(migration_context, Base.metadata)
+                if diffs:
+                    raise RuntimeError(
+                        "检测到无 alembic 版本记录的存量数据库，且其 schema 与当前模型存在差异。"
+                        "为避免跳过应有的迁移，启动已中止。请人工确认该库的实际版本后执行"
+                        " `alembic stamp <对应版本>`，再启动应用执行 `upgrade head`。"
+                        f"差异摘要：{diffs[:5]}"
+                    )
+                logger.info("存量数据库 schema 与当前模型一致，已 stamp 到 head")
                 command.stamp(alembic_cfg, "head")
             else:
                 command.upgrade(alembic_cfg, "head")

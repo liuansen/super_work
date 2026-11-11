@@ -3,12 +3,15 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -20,6 +23,7 @@ from backend.app.api.platforms.xhs.pc import (
 from backend.app.core.config import get_settings
 from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
+from backend.app.core.media_source import InvalidMediaSource, assert_owned_media_name
 from backend.app.core.time import shanghai_now
 from backend.app.core.security import decrypt_text
 from backend.app.models import AccountCookieVersion, AiDraft, Note, NoteAsset, NoteComment, PlatformAccount, Tag, User, note_tags
@@ -29,23 +33,29 @@ from backend.app.services.export_cleanup import prune_user_exports
 router = APIRouter(prefix="/notes", tags=["notes"])
 
 
+_URL_MAX_LENGTH = 2048
+UrlStr = Annotated[str, StringConstraints(max_length=_URL_MAX_LENGTH)]
+
+
 class BatchSaveNoteItem(BaseModel):
     note_id: str = Field(min_length=1, max_length=128)
-    note_url: str = ""
-    title: str = ""
+    note_url: UrlStr = ""
+    title: str = Field(default="", max_length=512)
     content: str = ""
-    author_name: str = ""
-    cover_url: str = ""
-    video_url: str = ""
-    video_addr: str = ""
-    image_urls: list[str] = Field(default_factory=list)
+    author_name: str = Field(default="", max_length=256)
+    cover_url: UrlStr = ""
+    video_url: UrlStr = ""
+    video_addr: UrlStr = ""
+    # 单条笔记图片上限：抑制恶意超大 payload（SEC-3）
+    image_urls: list[UrlStr] = Field(default_factory=list, max_length=20)
     raw: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchSaveNotesRequest(BaseModel):
     account_id: int
     fetch_comments: bool = False
-    notes: list[BatchSaveNoteItem] = Field(min_length=1)
+    # 单批最多 100 条：防止一次请求触发数百次外链下载
+    notes: list[BatchSaveNoteItem] = Field(min_length=1, max_length=100)
 
 
 class BatchTagNotesRequest(BaseModel):
@@ -95,8 +105,35 @@ def _asset_display_url(asset: NoteAsset) -> str:
     return asset.url
 
 
-def _serialize_note(db: Session, note: Note) -> dict:
-    assets = _get_note_assets(db, note)
+def _preload_note_relations(db: Session, notes: list[Note]) -> tuple[dict[int, list[NoteAsset]], dict[int, list[dict]]]:
+    """PERF-3：批量预取素材与标签（每列表 2 条查询），消除每行 2 次查询的 N+1。"""
+    note_ids = [n.id for n in notes]
+    assets_by_note: dict[int, list[NoteAsset]] = {}
+    tags_by_note: dict[int, list[dict]] = {}
+    if note_ids:
+        for asset in db.scalars(
+            select(NoteAsset)
+            .where(NoteAsset.note_id.in_(note_ids))
+            .order_by(NoteAsset.sort_order.asc(), NoteAsset.id.asc())
+        ).all():
+            assets_by_note.setdefault(asset.note_id, []).append(asset)
+        tag_rows = db.execute(
+            select(note_tags.c.note_id, Tag)
+            .join(Tag, Tag.id == note_tags.c.tag_id)
+            .where(note_tags.c.note_id.in_(note_ids))
+            .order_by(Tag.id.asc())
+        ).all()
+        for note_id, tag in tag_rows:
+            tags_by_note.setdefault(note_id, []).append(_serialize_tag(tag))
+    return assets_by_note, tags_by_note
+
+
+def _serialize_note(db: Session, note: Note, *, assets_by_note: dict[int, list[NoteAsset]] | None = None) -> dict:
+    assets = (
+        assets_by_note.get(note.id, [])
+        if assets_by_note is not None
+        else _get_note_assets(db, note)
+    )
     image_assets = [asset for asset in assets if asset.asset_type == "image"]
     video_assets = [asset for asset in assets if asset.asset_type == "video"]
     asset_urls = [_asset_display_url(asset) for asset in assets if asset.url or asset.local_path]
@@ -119,9 +156,19 @@ def _serialize_note(db: Session, note: Note) -> dict:
     }
 
 
-def _serialize_note_with_tags(db: Session, note: Note) -> dict:
-    serialized = _serialize_note(db, note)
-    serialized["tags"] = _get_note_tags(db, note.id)
+def _serialize_note_with_tags(
+    db: Session,
+    note: Note,
+    *,
+    assets_by_note: dict[int, list[NoteAsset]] | None = None,
+    tags_by_note: dict[int, list[dict]] | None = None,
+) -> dict:
+    serialized = _serialize_note(db, note, assets_by_note=assets_by_note)
+    serialized["tags"] = (
+        tags_by_note.get(note.id, [])
+        if tags_by_note is not None
+        else _get_note_tags(db, note.id)
+    )
     return serialized
 
 
@@ -130,8 +177,10 @@ def _build_notes_csv(db: Session, notes: list[Note]) -> str:
     fieldnames = ["note_id", "title", "author_name", "content", "tags", "created_at"]
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
+    # PERF-3：批量取标签，避免导出时每行一次查询
+    _, tags_by_note = _preload_note_relations(db, notes)
     for note in notes:
-        tags = ",".join(tag["name"] for tag in _get_note_tags(db, note.id))
+        tags = ",".join(tag["name"] for tag in tags_by_note.get(note.id, []))
         writer.writerow(
             {
                 "note_id": note.note_id,
@@ -273,11 +322,16 @@ def get_notes(
     total = db.scalar(select(func.count()).select_from(statement.subquery())) or 0
     pages = statement.order_by(Note.created_at.desc(), Note.id.desc())
     notes = db.scalars(pages.offset((page - 1) * page_size).limit(page_size)).all()
+    # PERF-3：整页只发 2 条批量查询取素材与标签（此前每行 2 次）
+    assets_by_note, tags_by_note = _preload_note_relations(db, notes)
     return {
         "total": total,
         "page": page,
         "page_size": page_size,
-        "items": [_serialize_note_with_tags(db, note) for note in notes],
+        "items": [
+            _serialize_note_with_tags(db, note, assets_by_note=assets_by_note, tags_by_note=tags_by_note)
+            for note in notes
+        ],
     }
 
 
@@ -350,7 +404,7 @@ def get_note_assets(
 
 class AddNoteAssetRequest(BaseModel):
     asset_type: str = Field(pattern="^(image|video)$")
-    url: str = Field(default="", max_length=2048)
+    url: UrlStr = ""
     local_path: str = Field(default="", max_length=512)
 
 
@@ -364,6 +418,12 @@ def add_note_asset(
     note = _get_owned_note(db, current_user, note_id)
     if not payload.url and not payload.local_path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="url or local_path is required")
+    # 本地媒体名归属校验（防跨用户引用）；url 仅作为外部来源记录，长度受 UrlStr 约束
+    if payload.local_path:
+        try:
+            assert_owned_media_name(payload.local_path, current_user.id)
+        except InvalidMediaSource as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     asset = NoteAsset(
         note_id=note.id,
         asset_type=payload.asset_type,
@@ -435,6 +495,23 @@ def _download_asset(url: str, user_id: int, asset_type: str) -> str | None:
     return download_asset_to_local(url, user_id, asset_type)
 
 
+# 单次批量入库的外链下载总预算：100 条笔记 × 每条最多 20 图 = 2000 次串行下载
+# 会把请求线程占住数十分钟，这里设总量上限，超出部分只保留远程 URL。
+_BATCH_SAVE_MAX_DOWNLOADS = 200
+
+
+def _remove_media_files(file_names: list[str]) -> None:
+    """批量入库失败时清理已落盘文件，避免 media 目录产生孤儿文件。"""
+    from pathlib import Path
+
+    from backend.app.core.media_storage import media_dir
+    for name in file_names:
+        try:
+            (media_dir / name).unlink(missing_ok=True)
+        except OSError:  # 清理失败不影响主流程
+            logger.warning("清理孤儿媒体文件失败: %s", name)
+
+
 @router.post("/batch-save")
 def batch_save_notes(
     payload: BatchSaveNotesRequest,
@@ -449,73 +526,106 @@ def batch_save_notes(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="PC account is required to fetch comments")
         comment_adapter = adapter_factory(_get_latest_account_cookies(db, account))
     saved_notes: list[Note] = []
+    downloaded_files: list[str] = []
+    skipped_downloads = 0
+    comment_errors: list[dict[str, str]] = []
+    # 预算按「尝试次数」而非「成功数」计：失败/被拒的 URL 同样要付出
+    # DNS + HTTP 出站成本，只数成功挡不住恶意 URL 列表占住请求线程
+    download_attempts = 0
 
-    for note_payload in payload.notes:
-        existing = db.scalars(
-            select(Note).where(
-                Note.user_id == current_user.id,
-                Note.note_id == note_payload.note_id,
-            )
-        ).first()
-        if existing is None:
-            existing = Note(
-                user_id=current_user.id,
-                platform_account_id=account.id,
-                platform=account.platform,
-                note_id=note_payload.note_id,
-            )
-            db.add(existing)
+    def _download(url: str, asset_type: str) -> str | None:
+        nonlocal skipped_downloads, download_attempts
+        download_attempts += 1
+        if download_attempts > _BATCH_SAVE_MAX_DOWNLOADS:
+            skipped_downloads += 1
+            return None
+        local_name = _download_asset(url, current_user.id, asset_type)
+        if local_name:
+            downloaded_files.append(local_name)
+        return local_name
 
-        existing.title = note_payload.title
-        existing.content = note_payload.content
-        existing.author_name = note_payload.author_name
-        merged_raw = dict(note_payload.raw) if note_payload.raw else {}
-        if note_payload.note_url:
-            merged_raw["note_url"] = note_payload.note_url
-        existing.raw_json = merged_raw
-        db.flush()
-        db.execute(delete(NoteAsset).where(NoteAsset.note_id == existing.id))
-        image_candidates = [*note_payload.image_urls] or ([note_payload.cover_url] if note_payload.cover_url else [])
-        unique_image_urls = [url for index, url in enumerate(image_candidates) if url and url not in image_candidates[:index]]
-        for image_url in unique_image_urls:
-            local_name = _download_asset(image_url, current_user.id, "image")
-            db.add(NoteAsset(note_id=existing.id, asset_type="image", url=image_url, local_path=local_name or ""))
-        video_url = note_payload.video_url or note_payload.video_addr
-        if video_url:
-            local_name = _download_asset(video_url, current_user.id, "video")
-            db.add(NoteAsset(note_id=existing.id, asset_type="video", url=video_url, local_path=local_name or ""))
-        if payload.fetch_comments and note_payload.note_url and comment_adapter is not None:
-            success, message, raw_payload = comment_adapter.get_note_comments(note_payload.note_url)
-            if not success:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=message or "XHS note comments failed",
+    try:
+        for note_payload in payload.notes:
+            existing = db.scalars(
+                select(Note).where(
+                    Note.user_id == current_user.id,
+                    Note.note_id == note_payload.note_id,
                 )
-            db.execute(delete(NoteComment).where(NoteComment.note_id == existing.id))
-            for comment in normalize_comment_payload(raw_payload):
-                db.add(
-                    NoteComment(
-                        note_id=existing.id,
-                        comment_id=comment["comment_id"],
-                        user_name=comment["user_name"],
-                        user_id=comment["user_id"],
-                        content=comment["content"],
-                        like_count=comment["like_count"],
-                        parent_comment_id=comment["parent_comment_id"],
-                        created_at_remote=comment["created_at_remote"],
-                        raw_json=comment["raw_json"],
+            ).first()
+            if existing is None:
+                existing = Note(
+                    user_id=current_user.id,
+                    platform_account_id=account.id,
+                    platform=account.platform,
+                    note_id=note_payload.note_id,
+                )
+                db.add(existing)
+
+            existing.title = note_payload.title
+            existing.content = note_payload.content
+            existing.author_name = note_payload.author_name
+            merged_raw = dict(note_payload.raw) if note_payload.raw else {}
+            if note_payload.note_url:
+                merged_raw["note_url"] = note_payload.note_url
+            existing.raw_json = merged_raw
+            db.flush()
+            db.execute(delete(NoteAsset).where(NoteAsset.note_id == existing.id))
+            image_candidates = [*note_payload.image_urls] or ([note_payload.cover_url] if note_payload.cover_url else [])
+            unique_image_urls = [url for index, url in enumerate(image_candidates) if url and url not in image_candidates[:index]]
+            for image_url in unique_image_urls:
+                local_name = _download(image_url, "image")
+                db.add(NoteAsset(note_id=existing.id, asset_type="image", url=image_url, local_path=local_name or ""))
+            video_url = note_payload.video_url or note_payload.video_addr
+            if video_url:
+                local_name = _download(video_url, "video")
+                db.add(NoteAsset(note_id=existing.id, asset_type="video", url=video_url, local_path=local_name or ""))
+            if payload.fetch_comments and note_payload.note_url and comment_adapter is not None:
+                success, message, raw_payload = comment_adapter.get_note_comments(note_payload.note_url)
+                if not success:
+                    # 单条评论抓取失败只降级该条，不再让整批 500
+                    # （此前整批回滚会留下已下载的孤儿文件）
+                    logger.warning(
+                        "batch-save 抓取评论失败 note_id=%s: %s", note_payload.note_id, message
                     )
-                )
-        saved_notes.append(existing)
+                    comment_errors.append(
+                        {"note_id": note_payload.note_id, "error": (message or "comments failed")[:200]}
+                    )
+                else:
+                    db.execute(delete(NoteComment).where(NoteComment.note_id == existing.id))
+                    for comment in normalize_comment_payload(raw_payload):
+                        db.add(
+                            NoteComment(
+                                note_id=existing.id,
+                                comment_id=comment["comment_id"],
+                                user_name=comment["user_name"],
+                                user_id=comment["user_id"],
+                                content=comment["content"],
+                                like_count=comment["like_count"],
+                                parent_comment_id=comment["parent_comment_id"],
+                                created_at_remote=comment["created_at_remote"],
+                                raw_json=comment["raw_json"],
+                            )
+                        )
+            saved_notes.append(existing)
 
-    db.commit()
+        db.commit()
+    except Exception:
+        db.rollback()
+        _remove_media_files(downloaded_files)
+        raise
+
     for note in saved_notes:
         db.refresh(note)
 
-    return {
+    response = {
         "saved_count": len(saved_notes),
         "items": [_serialize_note_with_tags(db, note) for note in saved_notes],
     }
+    if comment_errors:
+        response["comment_errors"] = comment_errors
+    if skipped_downloads:
+        response["skipped_downloads"] = skipped_downloads
+    return response
 
 
 @router.post("/batch-tag")
@@ -534,29 +644,40 @@ def batch_tag_notes(
         if tag is None or tag.user_id != current_user.id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
 
-    for note in notes:
-        if payload.mode == "replace":
-            db.execute(delete(note_tags).where(note_tags.c.note_id == note.id))
-            for tag_id in tag_ids:
-                db.execute(note_tags.insert().values(note_id=note.id, tag_id=tag_id))
-            continue
-
-        if payload.mode == "add":
-            existing_tag_ids = set(
-                db.scalars(select(note_tags.c.tag_id).where(note_tags.c.note_id == note.id)).all()
-            )
-            for tag_id in tag_ids:
-                if tag_id not in existing_tag_ids:
-                    db.execute(note_tags.insert().values(note_id=note.id, tag_id=tag_id))
-            continue
-
-        if tag_ids:
+    note_ids = [note.id for note in notes]
+    if payload.mode == "replace":
+        db.execute(delete(note_tags).where(note_tags.c.note_id.in_(note_ids)))
+        rows = [
+            {"note_id": note_id, "tag_id": tag_id}
+            for note_id in note_ids
+            for tag_id in tag_ids
+        ]
+        if rows:
+            db.execute(note_tags.insert(), rows)
+    elif payload.mode == "add":
+        # 一次取回全部已有映射后在内存 diff（此前每条笔记一次 SELECT）
+        existing_pairs = set(
             db.execute(
-                delete(note_tags).where(
-                    note_tags.c.note_id == note.id,
-                    note_tags.c.tag_id.in_(tag_ids),
+                select(note_tags.c.note_id, note_tags.c.tag_id).where(
+                    note_tags.c.note_id.in_(note_ids)
                 )
+            ).all()
+        )
+        rows = [
+            {"note_id": note_id, "tag_id": tag_id}
+            for note_id in note_ids
+            for tag_id in tag_ids
+            if (note_id, tag_id) not in existing_pairs
+        ]
+        if rows:
+            db.execute(note_tags.insert(), rows)
+    elif tag_ids:
+        db.execute(
+            delete(note_tags).where(
+                note_tags.c.note_id.in_(note_ids),
+                note_tags.c.tag_id.in_(tag_ids),
             )
+        )
 
     db.commit()
     return {
@@ -593,6 +714,5 @@ def export_notes(
     return {
         "exported_count": len(notes),
         "file_name": file_name,
-        "file_path": str(file_path.resolve()),
         "download_url": f"/api/files/exports/{file_name}",
     }

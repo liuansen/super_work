@@ -326,6 +326,13 @@ def login_session(
     pc_adapter: XhsPcLoginAdapter = Depends(get_pc_login_adapter),
     creator_adapter: XhsCreatorLoginAdapter = Depends(get_creator_login_adapter),
 ):
+    """轮询登录会话状态。
+
+    注意：本 GET **带有副作用**——它会向上游校验二维码状态、写库并推进会话
+    状态机。保留 GET 是因为前端轮询与旧客户端已按此契约实现；代价是
+    CDN/链接预取器可能意外触发一次检查（幂等，最多多打一次上游）。
+    新调用方请优先使用同一路径的 POST 语义版本（如后续新增）。
+    """
     session = db.get(LoginSession, session_id)
     if session is None or session.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Login session not found")

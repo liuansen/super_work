@@ -182,8 +182,38 @@ python main.py --with-frontend
 ### Docker 部署
 
 ```bash
+# 1. 准备环境变量（SECRET_KEY 必填，否则生产环境会拒绝启动）
+cp .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(48))"   # 写入 .env 的 SECRET_KEY
+
+# 2. 启动（默认只绑定 127.0.0.1:8000；需要公网访问时设置 APP_BIND_ADDR=0.0.0.0，
+#    并在前面加反向代理做 TLS 终止）
 docker compose up -d
 ```
+
+默认使用 SQLite 单容器（开箱可用）；接 MySQL 时设置 `DATABASE_TYPE=mysql`
+与 `DATABASE_MYSQL_*`，并放开 compose 中注释的 mysql 段。
+
+### 测试
+
+```bash
+# 后端（pytest，含 tests/backend 与 tests/douyin）
+pip install -r requirements-dev.txt
+python -m pytest
+
+# 前端
+cd frontend
+npm run typecheck     # TypeScript 严格检查
+npm test              # vitest 单元测试
+npm run test:node     # 路由/组件集成测试（node:test）
+
+# 端到端冒烟（真实后端 + 前端；首次需安装浏览器）
+npx playwright install chromium
+npm run test:e2e
+```
+
+> CI（.github/workflows/ci.yml）包含 5 个门禁：密钥扫描、后端 pytest（并行）、
+> 前端 typecheck/lint/单测、构建、Playwright e2e。
 
 ---
 
@@ -211,12 +241,53 @@ XHS_ALL_IN_ONE/
 │       ├── components/layout/      # 侧边栏 + 通知系统
 │       ├── lib/api.ts              # HTTP 客户端
 │       └── types/                  # TypeScript 类型
-├── tests/                          # 后端测试（126 passed）
+├── tests/                          # 后端测试（pytest）
 ├── Dockerfile                      # 多阶段构建
 └── docker-compose.yml              # 编排文件
 ```
 
 ---
+
+### 剪辑工坊（OpenCut）
+
+独立应用 `/clip`，把内容库、草稿和本地上传素材送到独立编辑器，导出 MP4 后回到工作台，可送入小红书草稿或抖音发布中心。
+
+- 编辑器地址：`CLIP_EDITOR_PUBLIC_BASE_URL`（默认 `http://127.0.0.1:3000`）
+- 允许的编辑器来源：`CLIP_EDITOR_ALLOWED_ORIGINS`（只对 `/api/clip/*` 生效的 CORS）
+- 成片大小上限：`CLIP_MAX_EXPORT_BYTES`（默认 2GiB）
+- 会话有效期：`CLIP_SESSION_TTL_HOURS`（默认 12 小时）
+- 活跃会话上限：`CLIP_MAX_ACTIVE_SESSIONS`（默认 3）
+- 每用户成片配额：`CLIP_USER_EXPORT_QUOTA_BYTES`
+
+M1/M2 验证阶段使用 `tools/clip-editor-stub` 契约编辑器：
+
+```bash
+docker compose up -d editor
+python main.py --with-frontend
+```
+
+OpenCut fork 完成后，将 `docker-compose.yml` 中 `editor` 服务的构建上下文替换为 fork 镜像，工作台接口不变。
+
+## 🛠 运维与可观测性
+
+| 能力 | 说明 |
+|---|---|
+| **请求 ID** | 每个响应带 `X-Request-ID`（请求头传入则透传），日志行自动携带，便于串联同一次请求 |
+| **结构化日志** | `LOG_JSON=1` 输出 JSON 行（含 request_id），`LOG_LEVEL` 控制级别 |
+| **指标** | `GET /api/metrics` 输出 Prometheus 文本格式（请求数/延迟/并发度），零额外依赖 |
+| **SQLite 备份** | 调度器每 24h 执行 `VACUUM INTO` 快照到 `data/backups/`，保留最近 `BACKUP_KEEP` 份 |
+| **分布式限流** | 设置 `REDIS_URL` 后登录限流与抓取限速在多 worker 间共享；未设置则回退进程内存 |
+| **长任务** | 手动运行自动运营超过 `TASK_SYNC_WAIT_SECONDS` 返回 202 + 任务 ID，到任务中心查看 |
+| **全文检索** | 笔记写入时生成 `search_text`；SQLite 自动建 FTS5(trigram) 索引，短词自动回退 LIKE |
+| **抖音隔离** | vendor 上游在子进程执行（崩溃隔离 + 硬超时），`DOUYIN_VENDOR_INPROCESS=1` 可回退排障 |
+
+### 密钥轮换
+
+```bash
+# 密钥只从环境变量读取（不要写在命令行：会进入 shell history 与进程列表）
+ROTATE_OLD_SECRET=<旧SECRET> ROTATE_NEW_FERNET_KEY=<新KEY>   python scripts/rotate_secrets.py --old-secret --new-fernet-key --dry-run
+ROTATE_OLD_SECRET=<旧SECRET> ROTATE_NEW_FERNET_KEY=<新KEY>   python scripts/rotate_secrets.py --old-secret --new-fernet-key
+```
 
 ## ⚙️ 配置说明
 
@@ -241,6 +312,42 @@ scheduler:
 - Cookie 有时效性，平台内置 2 小时自动健康巡检 + 过期通知
 - 所有敏感数据（Cookie、API Key）使用 Fernet 加密存储
 - AI 功能需在「模型配置」页面配置 OpenAI 兼容的 API 端点（支持火山引擎、阿里云百炼等）
+
+---
+
+## 🔐 安全升级与发布说明（2026-11）
+
+本次安全修复（详见 `FIX_PLAN.md`）引入以下行为变化，升级前请阅读：
+
+**必须操作**
+
+1. **设置密钥**：生产/容器环境（`ENVIRONMENT=production`）未设置 `SECRET_KEY` 将**拒绝启动**。生成方式：
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(48))"
+   ```
+   通过环境变量 `SECRET_KEY` / `FERNET_KEY` 提供。
+2. **密钥轮换**：从旧默认密钥迁移的存量库，先备份再运行 `python scripts/rotate_secrets.py --old-secret <旧KEY> --new-fernet-key <新KEY> --dry-run`，确认计数后去掉 `--dry-run` 实跑，最后切换环境变量。未轮换密文直接换密钥会导致 Cookie/API Key 永久不可解密。
+3. **重新登录**：更换 `SECRET_KEY` 后所有已签发令牌失效，用户需重新登录。
+
+**行为变化**
+
+- refresh token 改为 HttpOnly Cookie（XSS 无法窃取），不再写入 localStorage；刷新/登出携带 `X-Requested-With` 头。
+- 生产环境默认**关闭注册**（`REGISTRATION_ENABLED=true` 显式开启）；新密码最少 8 位；登录/注册有限流。
+- 素材来源仅接受：本用户上传的媒体文件名、`/api/files/media/` 形式、白名单 CDN 域名 URL；批量入库默认只读（`save_to_library: true` 显式入库）。
+- 列表接口全部服务端分页；上传超 100MB 返回 413；定时发布 `scheduled_at` 必须晚于当前时间。
+- 健康检查改用 `/api/health/ready`（探测数据库与迁移版本）。
+
+**已知限制（记录于 review）**
+
+- `retry` 对 `immediate` 发布任务：任务回到 pending 后需在发布中心手动点击发布（调度器只消费 scheduled 任务）。
+- 采集工具 UI 目前固定把抓取结果存入内容库；API 默认只读，如需纯预览请在 UI 层自行扩展开关。
+- 登录/注册限流为单进程内存实现，多 worker 部署需外置 Redis。
+- `scripts/rotate_secrets.py` 已被 `.dockerignore` 排除，请在宿主机对备份库执行。
+
+**数据库与回滚**
+
+- 升级前备份 `data/` 与 `backend/app/storage/`（含 `-wal`/`-shm`）；启动时自动执行 Alembic 迁移（新增 `auto_tasks.claimed_at`、`publish_jobs.user_id NOT NULL` 收紧、索引）。
+- 回滚：代码回退到上一版本即可，新增列/索引可保留；删除账号时关联笔记会保留（账号引用置空）。
 
 ---
 

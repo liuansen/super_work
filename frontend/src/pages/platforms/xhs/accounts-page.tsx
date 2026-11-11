@@ -24,7 +24,9 @@ import {
 import { useEffect, useState } from "react";
 
 import { AddAccountDrawer } from "../../../components/account/add-account-drawer";
-import { checkAccount, deleteAccount, fetchAccounts } from "../../../lib/api";
+import { checkAccount, deleteAccount } from "../../../lib/api";
+import { accountsQueryKey, useAccounts, useQueryClient } from "../../../hooks/use-accounts";
+import { useAuth } from "../../../hooks/use-auth";
 import { formatShanghaiTime } from "../../../lib/time";
 import type { PlatformAccount } from "../../../types";
 
@@ -57,23 +59,19 @@ const statusLabelMap: Record<string, string> = {
 };
 
 export function XhsAccountsPage() {
-  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  // 账号列表走共享缓存（useAccounts）：与其他页面共用同一份数据
+  const { accounts, isLoading, error: accountsError, refresh: loadAccounts } = useAccounts("xhs");
+  const queryClient = useQueryClient();
+  const auth = useAuth();
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
   const [checkingAccountIds, setCheckingAccountIds] = useState<Set<number>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
 
-  async function loadAccounts() {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const loadedAccounts = await fetchAccounts("xhs");
-      setAccounts(loadedAccounts);
-    } catch {
-      setError("账号列表加载失败。");
-    } finally {
-      setIsLoading(false);
-    }
+  /** 就地替换缓存中的单个账号（健康检查返回最新状态）。 */
+  function replaceCachedAccount(updated: PlatformAccount) {
+    queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs", auth.user?.id), (current) =>
+      (current ?? []).map((account) => (account.id === updated.id ? updated : account))
+    );
   }
 
   async function handleCheck(accountId: number) {
@@ -84,7 +82,7 @@ export function XhsAccountsPage() {
     setCheckingAccountIds((current) => new Set(current).add(accountId));
     try {
       const checked = await checkAccount(accountId);
-      setAccounts((current) => current.map((account) => (account.id === checked.id ? checked : account)));
+      replaceCachedAccount(checked);
     } catch {
       setError("账号健康检查失败。");
     } finally {
@@ -107,7 +105,9 @@ export function XhsAccountsPage() {
         setError(null);
         try {
           await deleteAccount(account.id);
-          setAccounts((current) => current.filter((item) => item.id !== account.id));
+          queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs", auth.user?.id), (current) =>
+            (current ?? []).filter((item) => item.id !== account.id)
+          );
         } catch {
           setError("账号删除失败。");
         }
@@ -128,7 +128,7 @@ export function XhsAccountsPage() {
             fontSize: 11,
             textTransform: "uppercase",
             letterSpacing: 1.5,
-            color: "rgba(255,255,255,0.35)",
+            color: "var(--app-text-disabled)",
             display: "block",
             marginBottom: 4,
           }}
@@ -137,10 +137,10 @@ export function XhsAccountsPage() {
         </Text>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div>
-            <Title level={3} style={{ margin: 0, color: "rgba(255,255,255,0.88)" }}>
+            <Title level={3} style={{ margin: 0, color: "var(--app-text)" }}>
               账号矩阵
             </Title>
-            <Text style={{ color: "rgba(255,255,255,0.45)", marginTop: 4, display: "block" }}>
+            <Text style={{ color: "var(--app-text-tertiary-weak)", marginTop: 4, display: "block" }}>
               管理 PC 与 Creator 账号、Cookie 状态、健康检查和账号作用域。
             </Text>
           </div>
@@ -153,32 +153,35 @@ export function XhsAccountsPage() {
       {/* Section card */}
       <Card
         title={
-          <span style={{ color: "rgba(255,255,255,0.88)", fontWeight: 600 }}>已绑定账号</span>
+          <span style={{ color: "var(--app-text)", fontWeight: 600 }}>已绑定账号</span>
         }
         extra={
-          <Button icon={<ReloadOutlined />} onClick={loadAccounts} loading={isLoading}>
+          <Button icon={<ReloadOutlined />} onClick={() => void loadAccounts()} loading={isLoading}>
             刷新
           </Button>
         }
-        style={{ background: "#1f1f1f", borderColor: "#303030" }}
+        style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)" }}
         styles={{ body: { padding: 24 } }}
       >
         {error ? <Alert type="error" message={error} showIcon style={{ marginBottom: 16 }} /> : null}
 
+        {error || accountsError ? (
+          <Alert type="error" showIcon message={error || "账号列表加载失败。"} style={{ marginBottom: 16 }} />
+        ) : null}
         {isLoading ? (
           <div style={{ textAlign: "center", padding: "48px 0" }}>
             <Spin size="large" />
           </div>
         ) : accounts.length === 0 ? (
           <Empty
-            image={<SafetyCertificateOutlined style={{ fontSize: 48, color: "rgba(255,255,255,0.25)" }} />}
+            image={<SafetyCertificateOutlined style={{ fontSize: 48, color: "var(--app-text-disabled)" }} />}
             imageStyle={{ height: 64 }}
             description={
               <Space direction="vertical" size={4}>
-                <Text strong style={{ color: "rgba(255,255,255,0.65)" }}>
+                <Text strong style={{ color: "var(--app-text-secondary)" }}>
                   还没有绑定小红书账号
                 </Text>
-                <Text style={{ color: "rgba(255,255,255,0.35)", fontSize: 13 }}>
+                <Text style={{ color: "var(--app-text-disabled)", fontSize: 13 }}>
                   先绑定一个 PC 账号，用于搜索、抓取和账号健康检查；Creator 账号用于发布。
                 </Text>
               </Space>
@@ -200,8 +203,8 @@ export function XhsAccountsPage() {
                   <Card
                     size="small"
                     style={{
-                      background: "#1a1a1a",
-                      borderColor: isCreator ? "#303050" : "#303030",
+                      background: "var(--app-panel-bg)",
+                      borderColor: isCreator ? "#303050" : "var(--app-border)",
                       borderLeft: `3px solid ${isCreator ? "#722ed1" : "#1668dc"}`,
                     }}
                     styles={{ body: { padding: 20 } }}
@@ -212,7 +215,7 @@ export function XhsAccountsPage() {
                         size={44}
                         src={account.avatar_url || undefined}
                         icon={!account.avatar_url ? <UserOutlined /> : undefined}
-                        style={{ background: "#262626", flexShrink: 0 }}
+                        style={{ background: "var(--app-elevated)", flexShrink: 0 }}
                       >
                         {!account.avatar_url ? (account.nickname?.slice(0, 1).toUpperCase() || "X") : undefined}
                       </Avatar>
@@ -220,14 +223,14 @@ export function XhsAccountsPage() {
                         <Text
                           strong
                           ellipsis
-                          style={{ display: "block", color: "rgba(255,255,255,0.88)", fontSize: 15 }}
+                          style={{ display: "block", color: "var(--app-text)", fontSize: 15 }}
                         >
                           {account.nickname || "未命名账号"}
                         </Text>
                         <Text
                           type="secondary"
                           ellipsis
-                          style={{ display: "block", fontSize: 12, color: "rgba(255,255,255,0.35)" }}
+                          style={{ display: "block", fontSize: 12, color: "var(--app-text-disabled)" }}
                         >
                           {account.external_user_id || "external id pending"}
                         </Text>
@@ -242,17 +245,17 @@ export function XhsAccountsPage() {
                       <Row gutter={16} style={{ marginBottom: 12 }}>
                         <Col span={12}>
                           <Statistic
-                            title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>类型</span>}
+                            title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>类型</span>}
                             value="Creator"
-                            valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                            valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                           />
                         </Col>
                         {profileValue(account, "red_id") ? (
                           <Col span={12}>
                             <Statistic
-                              title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>小红书号</span>}
+                              title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>小红书号</span>}
                               value={profileValue(account, "red_id") as string}
-                              valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                              valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                             />
                           </Col>
                         ) : null}
@@ -261,30 +264,30 @@ export function XhsAccountsPage() {
                       <Row gutter={12} style={{ marginBottom: 12 }}>
                         <Col span={6}>
                           <Statistic
-                            title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>类型</span>}
+                            title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>类型</span>}
                             value="PC"
-                            valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                            valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                           />
                         </Col>
                         <Col span={6}>
                           <Statistic
-                            title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>粉丝</span>}
+                            title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>粉丝</span>}
                             value={profileValue(account, "followers") || "-"}
-                            valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                            valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                           />
                         </Col>
                         <Col span={6}>
                           <Statistic
-                            title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>关注</span>}
+                            title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>关注</span>}
                             value={profileValue(account, "following") || "-"}
-                            valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                            valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                           />
                         </Col>
                         <Col span={6}>
                           <Statistic
-                            title={<span style={{ color: "rgba(255,255,255,0.45)", fontSize: 12 }}>获赞</span>}
+                            title={<span style={{ color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>获赞</span>}
                             value={profileValue(account, "likes") || "-"}
-                            valueStyle={{ color: "rgba(255,255,255,0.88)", fontSize: 14 }}
+                            valueStyle={{ color: "var(--app-text)", fontSize: 14 }}
                           />
                         </Col>
                       </Row>
@@ -294,7 +297,7 @@ export function XhsAccountsPage() {
                     {account.status_message ? (
                       <Text
                         type="secondary"
-                        style={{ display: "block", fontSize: 12, marginBottom: 12, color: "rgba(255,255,255,0.35)" }}
+                        style={{ display: "block", fontSize: 12, marginBottom: 12, color: "var(--app-text-disabled)" }}
                       >
                         {account.status_message}
                       </Text>
@@ -307,10 +310,10 @@ export function XhsAccountsPage() {
                         alignItems: "center",
                         justifyContent: "space-between",
                         paddingTop: 12,
-                        borderTop: "1px solid #303030",
+                        borderTop: "1px solid var(--app-border)",
                       }}
                     >
-                      <Text style={{ fontSize: 11, color: "rgba(255,255,255,0.3)" }}>
+                      <Text style={{ fontSize: 11, color: "var(--app-text-disabled)" }}>
                         更新时间：{formatDate(account.updated_at || account.created_at)}
                       </Text>
                       <Space size={4}>
@@ -339,7 +342,7 @@ export function XhsAccountsPage() {
         )}
       </Card>
 
-      <AddAccountDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} onBound={loadAccounts} />
+      <AddAccountDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} onBound={() => void loadAccounts()} />
     </div>
   );
 }

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.models import Tag, User, note_tags
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 
 router = APIRouter(prefix="/tags", tags=["tags"])
 
@@ -59,8 +59,15 @@ def list_tags(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    tags = db.scalars(select(Tag).where(Tag.user_id == current_user.id).order_by(Tag.id.asc())).all()
-    return paginated([serialize_tag(tag) for tag in tags], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        select(Tag).where(Tag.user_id == current_user.id),
+        page=page,
+        page_size=page_size,
+        serializer=serialize_tag,
+        order_by=Tag.id.asc(),
+    )
 
 
 @router.post("")

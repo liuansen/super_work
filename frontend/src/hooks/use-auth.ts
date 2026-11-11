@@ -13,13 +13,21 @@ type AuthSnapshot = {
 };
 
 let snapshot: AuthSnapshot = {
-  status: api.hasRefreshToken() ? "checking" : "anonymous",
+  // FE-6：refresh token 在 HttpOnly Cookie 中，客户端不可读——
+  // 初始一律进入 checking，由 /auth/refresh 探测结果决定最终状态
+  status: "checking",
   user: null,
   error: null
 };
 
 let bootstrapped = false;
 const listeners = new Set<() => void>();
+
+// FE-5：api 层刷新失败（登录过期）时同步 store 到匿名态，
+// 受保护页面会立即跳转登录页，不再滞留在"看似已登录"的状态
+api.onAuthExpired(() => {
+  emit({ status: "anonymous", user: null, error: "登录已过期，请重新登录。" });
+});
 
 function emit(next: AuthSnapshot): void {
   snapshot = next;
@@ -58,18 +66,18 @@ async function bootstrap(): Promise<void> {
     return;
   }
   bootstrapped = true;
-  if (!api.hasRefreshToken()) {
-    emit({ status: "anonymous", user: null, error: null });
-    return;
-  }
 
   emit({ ...snapshot, status: "checking", error: null });
   try {
     const user = await api.bootstrapAuth();
     emit(user ? { status: "authenticated", user, error: null } : { status: "anonymous", user: null, error: null });
   } catch {
-    api.clearAuthTokens();
-    emit({ status: "anonymous", user: null, error: "登录已过期，请重新登录。" });
+    // FE-5：网络/5xx 不销毁 token（api 层已保留），UI 回到匿名态并提示重试；
+    // 只有 api 层在明确 401/refresh 失效时才会清理凭证
+    // review P3：失败后复位 bootstrapped，否则后续任何挂载都不会再探测，
+    // 用户会一直停在“网络异常”的匿名态直到手动刷新页面
+    bootstrapped = false;
+    emit({ status: "anonymous", user: null, error: "网络异常，暂时无法验证登录状态，请稍后重试。" });
   }
 }
 

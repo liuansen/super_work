@@ -36,14 +36,15 @@ import { useEffect, useRef, useState } from "react";
 import { PageHeader } from "../../../components/layout/app-shell";
 import {
   deletePublishJob,
-  fetchAccounts,
   fetchPublishAssets,
   fetchPublishJob,
   fetchPublishJobs,
   publishJobToCreator,
   updatePublishJob,
+  extractErrorMessage
 } from "../../../lib/api";
 import { formatShanghaiTime } from "../../../lib/time";
+import { useAccounts } from "../../../hooks/use-accounts";
 import type { PlatformAccount, PublishAsset, PublishJob } from "../../../types";
 
 const { Title, Text, Paragraph } = Typography;
@@ -84,9 +85,9 @@ function isFutureScheduledAt(value: string): boolean {
 }
 
 const panelStyle: React.CSSProperties = {
-  background: "#1a1a1a",
+  background: "var(--app-panel-bg)",
   borderRadius: 8,
-  border: "1px solid #303030",
+  border: "1px solid var(--app-border)",
 };
 
 const cardBodyStyle: React.CSSProperties = { padding: 16 };
@@ -95,7 +96,7 @@ export function XhsPublishPage() {
   const [jobs, setJobs] = useState<PublishJob[]>([]);
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [assets, setAssets] = useState<PublishAsset[]>([]);
-  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const { accounts } = useAccounts("xhs");
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [publishMode, setPublishMode] = useState<"immediate" | "scheduled">("immediate");
@@ -160,12 +161,7 @@ export function XhsPublishPage() {
   }
 
   async function loadAccounts() {
-    try {
-      const result = await fetchAccounts("xhs");
-      setAccounts(result);
-    } catch {
-      setAccounts([]);
-    }
+    // 账号列表由 useAccounts 的共享缓存提供；loadJobs 之后无需重复拉取
   }
 
   async function loadJobs() {
@@ -257,8 +253,7 @@ export function XhsPublishPage() {
       applyJob(updated);
       setMessage(updated.status === "scheduled" ? `发布任务 #${updated.id} 已定时。` : `发布任务 #${updated.id} 已提交。`);
     } catch (err: unknown) {
-      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(d || "发布失败，请确认 Creator 账号和素材状态。");
+      setError(extractErrorMessage(err, "发布失败，请确认 Creator 账号和素材状态。"));
       try {
         const refreshed = await fetchPublishJob(selectedJob.id);
         setJobs((current) => current.map((job) => (job.id === refreshed.id ? refreshed : job)));
@@ -281,8 +276,7 @@ export function XhsPublishPage() {
       setSelectedAccountId(null);
       setMessage("发布任务已删除。");
     } catch (err: unknown) {
-      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(d || "发布任务删除失败。");
+      setError(extractErrorMessage(err, "发布任务删除失败。"));
     }
   }
 
@@ -313,13 +307,13 @@ export function XhsPublishPage() {
         <Card style={panelStyle} styles={{ body: cardBodyStyle }}>
           <div style={{ textAlign: "center", padding: 48 }}>
             <Spin size="large" />
-            <Paragraph style={{ color: "#8c8c8c", marginTop: 16 }}>正在加载发布任务...</Paragraph>
+            <Paragraph style={{ color: "var(--app-text-tertiary)", marginTop: 16 }}>正在加载发布任务...</Paragraph>
           </div>
         </Card>
       ) : jobs.length === 0 ? (
         <Card style={panelStyle} styles={{ body: cardBodyStyle }}>
           <Empty
-            image={<SendOutlined style={{ fontSize: 48, color: "#8c8c8c" }} />}
+            image={<SendOutlined style={{ fontSize: 48, color: "var(--app-text-tertiary)" }} />}
             imageStyle={{ height: 64 }}
             description={
               <div>
@@ -352,7 +346,7 @@ export function XhsPublishPage() {
               }
               extra={<Tag>{filteredJobs.length} 个</Tag>}
               style={panelStyle}
-              styles={{ body: { padding: 0 }, header: { borderBottom: "1px solid #303030" } }}
+              styles={{ body: { padding: 0 }, header: { borderBottom: "1px solid var(--app-border)" } }}
             >
               <List
                 dataSource={filteredJobs}
@@ -423,11 +417,11 @@ export function XhsPublishPage() {
                       <Card
                         title={<Space><EyeOutlined /><span>内容预览</span></Space>}
                         style={panelStyle}
-                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
                         extra={<Text type="secondary" style={{ fontSize: 12 }}>内容修改请前往草稿工坊</Text>}
                       >
                         <Title level={5} style={{ marginBottom: 8 }}>{selectedJob.title || "未填写标题"}</Title>
-                        <Paragraph style={{ whiteSpace: "pre-wrap", color: "rgba(255,255,255,.65)", fontSize: 13, marginBottom: 16 }}>
+                        <Paragraph style={{ whiteSpace: "pre-wrap", color: "var(--app-text-secondary)", fontSize: 13, marginBottom: 16 }}>
                           {selectedJob.body || "暂无正文"}
                         </Paragraph>
 
@@ -441,7 +435,7 @@ export function XhsPublishPage() {
                                 {imageAssets.map((asset) => (
                                   <Image
                                     key={asset.id}
-                                    src={asset.file_path}
+                                    src={asset.download_url || asset.file_path}
                                     width={80}
                                     height={80}
                                     style={{ objectFit: "cover", borderRadius: 6 }}
@@ -461,7 +455,7 @@ export function XhsPublishPage() {
                             </Text>
                             <Space wrap>
                               {videoAssets.map((asset) => (
-                                <Button key={asset.id} type="link" icon={<PlayCircleOutlined />} href={asset.file_path} target="_blank" rel="noreferrer" size="small">
+                                <Button key={asset.id} type="link" icon={<PlayCircleOutlined />} href={asset.download_url || asset.file_path} target="_blank" rel="noreferrer" size="small">
                                   查看视频
                                 </Button>
                               ))}
@@ -489,7 +483,7 @@ export function XhsPublishPage() {
                       <Card
                         title={<Space><CalendarOutlined /><span>发布参数</span></Space>}
                         style={{ ...panelStyle, marginBottom: 16 }}
-                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
                       >
                         <Form layout="vertical" size="small">
                           <Form.Item label="发布账号" required>
@@ -554,7 +548,7 @@ export function XhsPublishPage() {
                           </Space>
                         }
                         style={panelStyle}
-                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+                        styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
                       >
                         <List
                           size="small"
@@ -563,7 +557,7 @@ export function XhsPublishPage() {
                             <List.Item style={{ padding: "4px 0", border: "none" }}>
                               <Space>
                                 {check.ok ? <CheckCircleOutlined style={{ color: "#52c41a" }} /> : <ExclamationCircleOutlined style={{ color: "#ff4d4f" }} />}
-                                <Text style={{ color: check.ok ? "#8c8c8c" : "#ff4d4f", fontSize: 13 }}>{check.label}</Text>
+                                <Text style={{ color: check.ok ? "var(--app-text-tertiary)" : "#ff4d4f", fontSize: 13 }}>{check.label}</Text>
                               </Space>
                             </List.Item>
                           )}

@@ -22,6 +22,7 @@ import {
   message,
 } from "antd";
 import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 
 import {
   cancelDouyinPublishTask,
@@ -32,6 +33,7 @@ import {
   uploadDouyinMedia,
 } from "../api";
 import type { DouyinAccount, DouyinPublishTask, MediaUploadResult } from "../types";
+import { readDouyinPreselect } from "../preselect";
 import { DouyinPageHeader } from "../douyin-shell";
 
 const { Paragraph, Text } = Typography;
@@ -64,6 +66,7 @@ export function DouyinPublishingPage() {
   const [uploads, setUploads] = useState<MediaUploadResult[]>([]);
   const [uploading, setUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -75,13 +78,37 @@ export function DouyinPublishingPage() {
   }, []);
 
   useEffect(() => {
-    void load();
-    void fetchDouyinAccounts().then((list) => {
-      setAccounts(list);
-      const active = list.find((a) => a.status === "active");
-      if (active) form.setFieldValue("account_id", active.id);
-    });
+    void load().catch(() => {/* 失败提示已由统一拦截器处理 */});
+    void fetchDouyinAccounts()
+      .then((list) => {
+        setAccounts(list);
+        const active = list.find((a) => a.status === "active");
+        if (active) form.setFieldValue("account_id", active.id);
+      })
+      .catch(() => {/* 失败提示已由统一拦截器处理 */});
   }, [load, form]);
+
+  // 剪辑工坊「用于抖音发布」跳转预选：填入成片与标题并打开弹窗，
+  // 随后清掉 URL 参数避免刷新重复触发
+  useEffect(() => {
+    const preselect = readDouyinPreselect(searchParams);
+    if (!preselect.media) return;
+    setKind("video");
+    setUploads([
+      {
+        file_name: preselect.media,
+        download_url: `/api/files/media/${preselect.media}`,
+        asset_type: "video",
+        size: 0,
+      },
+    ]);
+    if (preselect.title) form.setFieldValue("title", preselect.title.slice(0, 20));
+    setOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("media");
+    next.delete("title");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams, form]);
 
   const activeAccounts = accounts.filter((a) => a.status === "active");
 
@@ -238,7 +265,7 @@ export function DouyinPublishingPage() {
                 description={
                   <>
                     <Paragraph type="secondary" style={{ marginBottom: 4 }}>
-                      账号 {task.account_id} · 可见性{" "}
+                      账号 {accounts.find((a) => a.id === task.account_id)?.nickname || task.account_id} · 可见性{" "}
                       {task.visibility === 0 ? "公开" : task.visibility === 1 ? "仅自己" : "好友"} ·
                       {task.allow_download ? " 允许下载" : " 不允许下载"}
                     </Paragraph>

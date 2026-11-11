@@ -87,6 +87,7 @@ class ImageAiClient(Protocol):
         api_key: str,
         prompt: str,
         reference_images: list[str] | None = None,
+        user_id: int | None = None,
     ) -> dict[str, Any]:
         ...
 
@@ -127,6 +128,47 @@ def _load_json_response(response: requests.Response) -> Any:
     raise ValueError("AI response is not valid JSON") from last_error
 
 
+def _assert_public_model_endpoint(base_url: str) -> None:
+    """SEC-5（review P1-5）：AI 请求（带 Authorization）发出前校验端点。
+
+    保存/测试连接时已校验过，但存在 TOCTOU——域名可被解析到内网。
+    这里做完整 DNS 解析校验；allow_private_model_endpoints=true（本地
+    Ollama 场景）仍放行私网/环回，但无条件拒绝链路本地/保留段。
+    """
+    from backend.app.core.config import get_settings
+    from backend.app.core.net_guard import public_http_url_error
+
+    error = public_http_url_error(
+        base_url,
+        resolve_dns=True,
+        block_private=not getattr(get_settings(), "allow_private_model_endpoints", True),
+    )
+    if error:
+        raise ValueError(f"模型端点被安全策略拒绝: {error}")
+
+
+# 匹配 "属于某用户的本地媒体文件名"（xhs-<kind>-u<数字>-…），与
+# core/media_source._OWNED_MEDIA_RE 同口径；此处仅做形态判断，归属校验
+# 仍统一交给 assert_owned_media_name。
+_OWNED_MEDIA_NAME_RE = re.compile(r"^xhs-[a-z]+-u\d+-")
+
+
+def _post_no_redirect(url: str, **kwargs: Any) -> requests.Response:
+    """向用户可配置的模型端点发请求时禁止跟随重定向。
+
+    SSRF 校验（_assert_public_model_endpoint）只覆盖 base_url 本身；
+    requests 默认 allow_redirects=True，攻击者可让自有域名 302 到内网
+    （如 169.254.169.254），从而绕过校验，并把 Authorization 里的
+    API Key 一并送给重定向目标。这里拒绝任何重定向响应。
+    """
+    kwargs.setdefault("allow_redirects", False)
+    response = requests.post(url, **kwargs)
+    # 用 status_code 判定（而非 is_redirect），便于测试注入的轻量 response 替身
+    if 300 <= getattr(response, "status_code", 0) < 400:
+        raise ValueError("模型端点返回重定向，已按安全策略拒绝跟随")
+    return response
+
+
 class OpenAICompatibleTextClient:
     def _complete(
         self,
@@ -145,7 +187,8 @@ class OpenAICompatibleTextClient:
             raise ValueError("Text model api_key is required")
 
         endpoint = f"{model_config.base_url.rstrip('/')}/chat/completions"
-        response = requests.post(
+        _assert_public_model_endpoint(model_config.base_url)
+        response = _post_no_redirect(
             endpoint,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={
@@ -308,8 +351,12 @@ class OpenAICompatibleImageClient:
         size: str,
         style: str,
     ) -> dict[str, Any]:
+        # BE-11：size 需要真正写入请求体（此前被静默丢弃）
         return self.generate_image(
-            model_config=model_config, api_key=api_key, prompt=f"{prompt}\nStyle: {style or 'clean XHS cover'}",
+            model_config=model_config,
+            api_key=api_key,
+            prompt=f"{prompt}\nStyle: {style or 'clean XHS cover'}",
+            size=size,
         )
 
     def generate_image(
@@ -319,16 +366,21 @@ class OpenAICompatibleImageClient:
         api_key: str,
         prompt: str,
         reference_images: list[str] | None = None,
+        size: str | None = None,
+        user_id: int | None = None,
     ) -> dict[str, Any]:
         self._validate(model_config=model_config, api_key=api_key)
         endpoint = f"{model_config.base_url.rstrip('/')}/images/generations"
+        _assert_public_model_endpoint(model_config.base_url)
         body: dict[str, Any] = {
             "model": model_config.model_name,
             "prompt": prompt,
             "response_format": "url",
         }
+        if size:
+            body["size"] = size
         if reference_images:
-            resolved = [self._resolve_image_ref(url) for url in reference_images]
+            resolved = [self._resolve_image_ref(url, user_id=user_id) for url in reference_images]
             if len(resolved) == 1:
                 body["image"] = resolved[0]
             else:
@@ -336,7 +388,7 @@ class OpenAICompatibleImageClient:
                 body["sequential_image_generation"] = "disabled"
             body["watermark"] = False
         try:
-            response = requests.post(
+            response = _post_no_redirect(
                 endpoint,
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=body,
@@ -362,20 +414,29 @@ class OpenAICompatibleImageClient:
         return {"url": image_ref, "raw": payload}
 
     @staticmethod
-    def _resolve_image_ref(url: str) -> str:
-        if url.startswith("http://") or url.startswith("https://"):
+    def _resolve_image_ref(url: str, *, user_id: int | None = None) -> str:
+        if url.startswith(("http://", "https://", "data:")):
             return url
-        if url.startswith("/api/files/media/"):
+        if url.startswith("/api/files/media/") or _OWNED_MEDIA_NAME_RE.match(url):
+            # 本地媒体（带 /api/files/media/ 前缀或裸文件名两种形态）：
+            # 必须归属当前用户，否则会把他人素材 base64 外发给用户自选的
+            # 第三方模型端点（SEC-2）。口径与 creator 上传端点一致。
             import base64
             from pathlib import Path
-            from backend.app.core.config import get_settings
-            file_name = url.split("/")[-1]
-            local = Path(get_settings().storage_dir) / "media" / file_name
+            from backend.app.core.media_source import assert_owned_media_name
+            from backend.app.core.media_storage import media_path
+
+            file_name = url.rsplit("/", 1)[-1]
+            if user_id is None:
+                raise ValueError("引用本地素材时必须提供用户身份")
+            assert_owned_media_name(file_name, user_id)
+            local = media_path(file_name)
             if local.is_file():
                 raw = local.read_bytes()
                 ext = local.suffix.lower().lstrip(".")
                 mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/png")
                 return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
+            raise ValueError(f"参考图文件不存在: {file_name[:64]}")
         return url
 
     def describe_image(
@@ -388,7 +449,8 @@ class OpenAICompatibleImageClient:
     ) -> str:
         self._validate(model_config=model_config, api_key=api_key)
         endpoint = f"{model_config.base_url.rstrip('/')}/chat/completions"
-        response = requests.post(
+        _assert_public_model_endpoint(model_config.base_url)
+        response = _post_no_redirect(
             endpoint,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json={

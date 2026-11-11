@@ -20,7 +20,7 @@ export function ProtectedRoute({ children }: RouteGuardProps) {
           alignItems: "center",
           justifyContent: "center",
           minHeight: "100vh",
-          background: "#0a0a0a",
+          background: "var(--app-bg-deep)",
         }}
       >
         <Spin size="large" tip="正在验证登录状态..." />
@@ -46,7 +46,7 @@ export function PublicOnlyRoute({ children }: RouteGuardProps) {
           alignItems: "center",
           justifyContent: "center",
           minHeight: "100vh",
-          background: "#0a0a0a",
+          background: "var(--app-bg-deep)",
         }}
       >
         <Spin size="large" tip="正在验证登录状态..." />

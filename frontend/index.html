@@ -6,6 +6,19 @@
     <meta name="referrer" content="no-referrer" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>Spider_XHS Operations</title>
+    <script>
+      // 复核 P2：主题在 React 执行前同步设置，避免暗色用户每次刷新
+      // 先看到浏览器白底（data-theme 与 providers.tsx 的存储键保持一致）
+      (function () {
+        try {
+          var mode = localStorage.getItem("theme-mode") === "light" ? "light" : "dark";
+          document.documentElement.dataset.theme = mode;
+          document.documentElement.style.background = mode === "dark" ? "#141414" : "#f5f5f5";
+        } catch (e) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

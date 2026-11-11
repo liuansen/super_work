@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   # --------------------------------------------------------------------------
   # Spider_XHS Application
@@ -7,44 +5,73 @@ services:
   app:
     build: .
     container_name: spider-xhs
+    # 默认只绑定回环地址：管理后台持有平台账号 Cookie，不应默认暴露到公网。
+    # 需要对外提供访问时设置 APP_BIND_ADDR=0.0.0.0，并在前面加反向代理（TLS）。
     ports:
-      - "8000:8000"
+      - "${APP_BIND_ADDR:-127.0.0.1}:8000:8000"
     volumes:
       - ./data:/app/data
       - ./config:/app/config
       - ./backend/app/storage/media:/app/backend/app/storage/media
       - ./backend/app/storage/exports:/app/backend/app/storage/exports
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - CONFIG_FILE=/app/config/default.yaml
-      # Override sensitive values via env vars in production:
-      # - SECRET_KEY=your-production-secret-key
-      # - FERNET_KEY=your-fernet-key
-      # - DATABASE_TYPE=mysql
-      # - DATABASE_MYSQL_HOST=mysql
-      # - DATABASE_MYSQL_PASSWORD=your-mysql-password
+      CONFIG_FILE: ${CONFIG_FILE:-/app/config/production.yaml}
+      # 容器运行视为生产环境：未设置 SECRET_KEY 时启动会被拒绝
+      # （见 backend/app/core/config.py::assert_runtime_safety）。
+      # 这里用 ${SECRET_KEY:?...} 让 compose 直接给出可读错误，
+      # 而不是让容器进入 restart 无限崩溃循环。
+      ENVIRONMENT: production
+      SECRET_KEY: ${SECRET_KEY:?请先设置 SECRET_KEY（可复制 .env.example 为 .env 并生成随机密钥）}
+      FERNET_KEY: ${FERNET_KEY:-}
+      # 单容器默认 SQLite（开箱可用）；接 MySQL 时设置 DATABASE_TYPE=mysql 并放开下面注释段
+      DATABASE_TYPE: ${DATABASE_TYPE:-sqlite}
+      DATABASE_SQLITE_PATH: ${DATABASE_SQLITE_PATH:-./data/spider_xhs.db}
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-true}
+      SERVER_HOST: "0.0.0.0"
+      # 可选：多副本/多 worker 部署时设置 Redis 共享限流计数
+      REDIS_URL: ${REDIS_URL:-}
+      # 日志与备份
+      LOG_JSON: ${LOG_JSON:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      BACKUP_ENABLED: ${BACKUP_ENABLED:-true}
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/ready"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
   # --------------------------------------------------------------------------
+  # 剪辑工坊契约编辑器（仅用于 M1/M2 验证；OpenCut fork 完成后替换同一入口）
+  # --------------------------------------------------------------------------
+  editor:
+    build:
+      context: ./tools/clip-editor-stub
+    container_name: clip-editor-stub
+    ports:
+      - "${CLIP_EDITOR_BIND_ADDR:-127.0.0.1}:3000:80"
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
   # MySQL (optional, for production deployments)
   # Uncomment this section and the volumes block below to use MySQL.
-  # Also set DATABASE_TYPE=mysql in the app environment.
+  # Also set DATABASE_TYPE=mysql (and DATABASE_MYSQL_* values) in .env
   # --------------------------------------------------------------------------
   # mysql:
   #   image: mysql:8.0
   #   container_name: spider-xhs-mysql
   #   environment:
-  #     MYSQL_ROOT_PASSWORD: rootpass
-  #     MYSQL_DATABASE: spider_xhs
-  #     MYSQL_USER: spider_xhs
-  #     MYSQL_PASSWORD: change_me
+  #     MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+  #     MYSQL_DATABASE: ${MYSQL_DATABASE:-spider_xhs}
+  #     MYSQL_USER: ${MYSQL_USER:-spider_xhs}
+  #     MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
   #   ports:
-  #     - "3306:3306"
+  #     - "127.0.0.1:3306:3306"
   #   volumes:
   #     - mysql_data:/var/lib/mysql
   #   command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci

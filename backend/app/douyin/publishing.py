@@ -58,7 +58,12 @@ def resolve_media_paths(user_id: int, media_names: list[str]) -> list[str]:
     """
     from pathlib import Path
 
-    allowed = (f"xhs-upload-u{user_id}-", f"xhs-image-u{user_id}-")
+    # xhs-clip-u：剪辑工坊成片可直接用于抖音发布
+    allowed = (
+        f"xhs-upload-u{user_id}-",
+        f"xhs-image-u{user_id}-",
+        f"xhs-clip-u{user_id}-",
+    )
     media_root = Path(_media_dir_name()).resolve()
     resolved: list[str] = []
     for name in media_names:
@@ -121,12 +126,14 @@ def get_owned_task(db: Session, user_id: int, task_id: int) -> Optional[DouyinPu
     )
 
 
-def list_tasks(db: Session, user_id: int) -> list[DouyinPublishTask]:
+def list_tasks(db: Session, user_id: int, limit: int = 200) -> list[DouyinPublishTask]:
+    # review P2：此前无上限，任务表增长后响应无界
     return list(
         db.scalars(
             select(DouyinPublishTask)
             .where(DouyinPublishTask.user_id == user_id)
             .order_by(DouyinPublishTask.id.desc())
+            .limit(limit)
         )
     )
 
@@ -162,7 +169,7 @@ def create_task(
 
     digest = _payload_digest(
         {
-            "account_id": account.id, "kind": kind, "media_names": sorted(media_names),
+            "account_id": account.id, "kind": kind, "media_names": media_names,
             "title": title, "description": description, "visibility": visibility,
             "allow_download": allow_download,
             "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
@@ -216,7 +223,8 @@ def _verify_idempotent_payload(existing: DouyinPublishTask, digest: str) -> None
     existing_digest = _payload_digest(
         {
             "account_id": existing.account_id, "kind": existing.kind,
-            "media_names": sorted(json.loads(existing.media_names_json or "[]")),
+            # 不排序：媒体顺序（图集页序）是载荷语义的一部分，重排即异载荷。
+            "media_names": json.loads(existing.media_names_json or "[]"),
             "title": existing.title, "description": existing.description,
             "visibility": existing.visibility, "allow_download": existing.allow_download,
             "scheduled_at": existing.scheduled_at.isoformat() if existing.scheduled_at else None,
@@ -259,6 +267,24 @@ def execute_task(
     db.commit()  # 先落“已领取”，再发起任何平台请求
 
     task = get_owned_task(db, user_id, task_id)
+    # 应用权限：领取到执行之间可能发生 clip 回收——执行前对存储在任务里的
+    # xhs-clip- 素材名复检权限（review 第 3 轮 F1 双闸之一）
+    import json as _json
+
+    stored_names = _json.loads(task.media_names_json or "[]")
+    if any(
+        str(name).startswith(f"xhs-clip-u{user_id}-") for name in stored_names
+    ):
+        from backend.app.models import User
+        from backend.app.services.app_perms import user_has_access
+
+        user = db.get(User, user_id)
+        if user is None or not user_has_access(db, user, "clip"):
+            task.status = STATUS_FAILED
+            task.error_message = "剪辑工坊权限已被回收，无法发布该任务的成片素材"
+            db.commit()
+            db.refresh(task)
+            return task
     account = db.get(DouyinAccount, task.account_id)
     if account is None or account.user_id != user_id:
         task.status = STATUS_FAILED

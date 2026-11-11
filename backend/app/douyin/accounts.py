@@ -37,12 +37,14 @@ def get_owned_account(db: Session, user_id: int, account_id: int) -> Optional[Do
     )
 
 
-def list_accounts(db: Session, user_id: int) -> list[DouyinAccount]:
+def list_accounts(db: Session, user_id: int, limit: int = 200) -> list[DouyinAccount]:
+    # review P2：此前无上限，数据增长后响应无界。默认取前 200 个。
     return list(
         db.scalars(
             select(DouyinAccount)
             .where(DouyinAccount.user_id == user_id)
             .order_by(DouyinAccount.id)
+            .limit(limit)
         )
     )
 
@@ -103,6 +105,21 @@ def upsert_account(
         if existing is None:
             existing = DouyinAccount(user_id=user_id)
             db.add(existing)
+    elif identity.provider_account_id:
+        # 重新授权时凭证可能属于同用户的另一已绑定账号：提前拒绝，
+        # 避免改写本行 provider_account_id 后撞 (user, sec_uid) 唯一约束变成 500。
+        conflict = db.scalar(
+            select(DouyinAccount).where(
+                DouyinAccount.user_id == user_id,
+                DouyinAccount.provider_account_id == identity.provider_account_id,
+                DouyinAccount.id != existing.id,
+            )
+        )
+        if conflict is not None:
+            raise ValueError(
+                f"该 Cookie 属于已绑定的账号「{conflict.nickname or conflict.provider_account_id}」，"
+                "请直接使用该账号，或先解绑后再绑定"
+            )
     _apply_identity(existing, identity, cookie)
     db.commit()
     db.refresh(existing)

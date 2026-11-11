@@ -23,6 +23,14 @@ export const workbenchApps: readonly WorkbenchApp[] = [
     icon: '/logo.jpg',
     entryPath: '/platforms/douyin/accounts',
     enabled: true
+  },
+  {
+    id: 'clip',
+    name: '剪辑工坊',
+    description: '从内容库选素材，剪辑成片并送入小红书或抖音发布',
+    icon: '/logo.jpg',
+    entryPath: '/clip',
+    enabled: true
   }
 ];
 

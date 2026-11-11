@@ -40,10 +40,10 @@ export function AddAccountDrawer({ open, onClose, onBound }: AddAccountDrawerPro
     <Drawer
       title={
         <div>
-          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.45)", marginBottom: 4, textTransform: "uppercase", letterSpacing: 1 }}>
+          <div style={{ fontSize: 12, color: "var(--app-text-tertiary-weak)", marginBottom: 4, textTransform: "uppercase", letterSpacing: 1 }}>
             XHS Account
           </div>
-          <div style={{ fontSize: 18, fontWeight: 600, color: "rgba(255,255,255,0.88)" }}>添加小红书账号</div>
+          <div style={{ fontSize: 18, fontWeight: 600, color: "var(--app-text)" }}>添加小红书账号</div>
         </div>
       }
       placement="right"
@@ -52,8 +52,8 @@ export function AddAccountDrawer({ open, onClose, onBound }: AddAccountDrawerPro
       onClose={onClose}
       destroyOnClose
       styles={{
-        header: { background: "#1f1f1f", borderBottom: "1px solid #303030" },
-        body: { background: "#141414", padding: 24 },
+        header: { background: "var(--app-surface-alt)", borderBottom: "1px solid var(--app-border)" },
+        body: { background: "var(--app-bg)", padding: 24 },
       }}
     >
       <div style={{ marginBottom: 20 }}>
@@ -79,7 +79,8 @@ export function AddAccountDrawer({ open, onClose, onBound }: AddAccountDrawerPro
       ) : method === "cookie" ? (
         <CookieImportPanel accountType={accountType} onImported={handleConfirmed} />
       ) : (
-        <PhoneLoginPanel accountType={accountType} onConfirmed={handleConfirmed} />
+        // FE-13：切换账号类型时强制重建面板，旧 sessionId/验证码状态不跨类型复用
+        <PhoneLoginPanel key={accountType} accountType={accountType} onConfirmed={handleConfirmed} />
       )}
     </Drawer>
   );

@@ -144,10 +144,10 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
             justifyContent: "center",
             padding: 24,
             minHeight: 220,
-            background: "#1f1f1f",
+            background: "var(--app-surface-alt)",
           },
         }}
-        style={{ borderColor: "#303030" }}
+        style={{ borderColor: "var(--app-border)" }}
       >
         {session?.qr_image_data_url ? (
           <img
@@ -163,9 +163,9 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              background: "#262626",
+              background: "var(--app-elevated)",
               borderRadius: 8,
-              color: "rgba(255,255,255,0.3)",
+              color: "var(--app-text-disabled)",
               fontSize: 28,
               fontWeight: 700,
             }}
@@ -176,7 +176,7 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
       </Card>
 
       <div style={{ textAlign: "center" }}>
-        <Text strong style={{ display: "block", marginBottom: 4, color: "rgba(255,255,255,0.88)" }}>
+        <Text strong style={{ display: "block", marginBottom: 4, color: "var(--app-text)" }}>
           {statusText}
         </Text>
         {session?.qr_url ? (
@@ -190,7 +190,7 @@ export function QrLoginPanel({ accountType, onConfirmed }: QrLoginPanelProps) {
         <Checkbox
           checked={syncCreator}
           onChange={(event) => setSyncCreator(event.target.checked)}
-          style={{ color: "rgba(255,255,255,0.88)" }}
+          style={{ color: "var(--app-text)" }}
         >
           登录 PC 后同步 Creator 账号
         </Checkbox>

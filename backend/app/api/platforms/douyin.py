@@ -7,13 +7,14 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.douyin import get_adapter
 from backend.app.core.database import get_db
-from backend.app.core.deps import get_current_user
+from backend.app.core.deps import app_access_required, get_current_user
 from backend.app.douyin import accounts as accounts_service
 from backend.app.douyin import metrics as metrics_service
 from backend.app.douyin import publishing as publishing_service
@@ -25,9 +26,14 @@ from backend.app.douyin.contracts import (
     DouyinNetworkError,
     DouyinUpstreamError,
 )
+from backend.app.douyin.models import DouyinPublishTask, DouyinReferenceWork
 from backend.app.models import User
 
-router = APIRouter(prefix="/douyin", tags=["douyin"])
+router = APIRouter(
+    prefix="/douyin",
+    tags=["douyin"],
+    dependencies=[Depends(app_access_required("douyin"))],
+)
 
 
 def adapter_dependency() -> DouyinAdapter:
@@ -80,9 +86,13 @@ class PublishTaskCreateRequest(BaseModel):
 
 @router.get("/accounts")
 def list_accounts(
+    limit: int = Query(200, ge=1, le=1000),
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    return [accounts_service.serialize_account(a) for a in accounts_service.list_accounts(db, current_user.id)]
+    return [
+        accounts_service.serialize_account(a)
+        for a in accounts_service.list_accounts(db, current_user.id, limit=limit)
+    ]
 
 
 @router.post("/accounts")
@@ -98,6 +108,9 @@ def create_account(
         )
     except LookupError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error))
+    except ValueError as error:
+        # 重新授权的凭证属于同用户另一已绑定账号（upsert_account 冲突检查）
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     except DouyinAdapterError as error:
         raise _map_adapter_error(error)
     return accounts_service.serialize_account(account)
@@ -126,6 +139,29 @@ def delete_account(
     account = accounts_service.get_owned_account(db, current_user.id, account_id)
     if account is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
+    # 外键强制开启：删除账号必须先处理引用行。
+    # 1) 未终结任务（pending/running/unknown）→ 拒绝，避免销毁可执行/结果不明的任务记录；
+    # 2) 终态任务（succeeded/failed/cancelled）随账号删除（删号即明确放弃该账号任务历史）；
+    # 3) 参考作品是用户数据，与账号解绑（source_account_id 置空）后保留。
+    unfinished = db.scalar(
+        select(func.count())
+        .select_from(DouyinPublishTask)
+        .where(
+            DouyinPublishTask.account_id == account_id,
+            DouyinPublishTask.status.in_(("pending", "running", "unknown")),
+        )
+    )
+    if unfinished:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该账号存在未完成的发布任务（含结果不明），请先取消或等待结束后再删除",
+        )
+    db.execute(
+        update(DouyinReferenceWork)
+        .where(DouyinReferenceWork.source_account_id == account_id)
+        .values(source_account_id=None)
+    )
+    db.execute(delete(DouyinPublishTask).where(DouyinPublishTask.account_id == account_id))
     db.delete(account)
     db.commit()
     return {"deleted": True}
@@ -161,9 +197,12 @@ def collect_reference(
 @router.get("/references")
 def list_references(
     keyword: str = "", tag: str = "",
+    limit: int = Query(200, ge=1, le=1000),
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db),
 ):
-    rows = references_service.list_references(db, current_user.id, keyword=keyword, tag=tag)
+    rows = references_service.list_references(
+        db, current_user.id, keyword=keyword, tag=tag, limit=limit
+    )
     return [references_service.serialize_reference(r) for r in rows]
 
 
@@ -187,9 +226,10 @@ def update_reference(
 
 @router.get("/works")
 def list_works(
+    limit: int = Query(200, ge=1, le=1000),
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    rows = references_service.list_references(db, current_user.id)
+    rows = references_service.list_references(db, current_user.id, limit=limit)
     latest = metrics_service.latest_metrics_map(db, current_user.id, [r.id for r in rows])
     return [
         references_service.serialize_reference(r, latest_metrics=latest.get(r.id))
@@ -238,9 +278,11 @@ def refresh_account_works(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"账号状态为 {account.status}，请先重新授权")
     try:
         created = metrics_service.refresh_account_works(db, current_user.id, account, adapter)
-    except DouyinAdapterError as error:
+    except (DouyinAdapterError, ValueError) as error:
         db.rollback()
-        raise _map_adapter_error(error)
+        raise _map_adapter_error(error) if isinstance(error, DouyinAdapterError) else HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)
+        )
     return {"snapshots": [metrics_service.serialize_snapshot(s) for s in created]}
 
 
@@ -249,9 +291,13 @@ def refresh_account_works(
 
 @router.get("/publish/tasks")
 def list_publish_tasks(
+    limit: int = Query(200, ge=1, le=1000),
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
-    return [publishing_service.serialize_task(t) for t in publishing_service.list_tasks(db, current_user.id)]
+    return [
+        publishing_service.serialize_task(t)
+        for t in publishing_service.list_tasks(db, current_user.id, limit=limit)
+    ]
 
 
 @router.post("/publish/tasks")
@@ -265,6 +311,17 @@ def create_publish_task(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="账号不存在")
     if account.status != "active":
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"账号状态为 {account.status}，请先重新授权")
+    # 应用权限：剪辑工坊被回收后，回收前获知的 xhs-clip- 成片不得再用于发布
+    if any(
+        name.startswith(f"xhs-clip-u{current_user.id}-") for name in payload.media_names
+    ):
+        from backend.app.services.app_perms import user_has_access
+
+        if not user_has_access(db, current_user, "clip"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="该应用未对当前账号开通，请联系管理员",
+            )
     try:
         task, created = publishing_service.create_task(
             db, current_user.id, account=account, kind=payload.kind,

@@ -14,12 +14,13 @@ from sqlalchemy.orm import Session
 
 from backend.app.core.config import get_settings
 from backend.app.core.database import get_db
-from backend.app.core.deps import get_current_user
+from backend.app.core.deps import app_access_required, get_current_user
 from backend.app.core.time import shanghai_now
 from backend.app.services.export_cleanup import prune_user_exports
 from backend.app.models import AiDraft, KeywordGroup, MonitoringTarget, Note, NoteComment, PlatformAccount, PublishJob, Tag, User, note_tags
 
-router = APIRouter(prefix="/xhs/analytics", tags=["xhs-analytics"])
+router = APIRouter(
+    dependencies=[Depends(app_access_required("xhs"))],prefix="/xhs/analytics", tags=["xhs-analytics"])
 
 
 class AnalyticsReportRequest(BaseModel):
@@ -85,15 +86,10 @@ def _owned_notes(db: Session, current_user: User) -> list[Note]:
 
 
 def _note_haystack(note: Note) -> str:
-    return "\n".join(
-        [
-            note.note_id or "",
-            note.title or "",
-            note.content or "",
-            note.author_name or "",
-            str(note.raw_json or {}),
-        ]
-    ).lower()
+    # 统一实现见 services/note_search：读取写入时算好的 search_text
+    from backend.app.services.note_search import note_haystack
+
+    return note_haystack(note)
 
 
 def _note_matches_value(note: Note, value: str) -> bool:
@@ -273,12 +269,16 @@ def _keyword_trend_items(db: Session, current_user: User, notes: list[Note]) -> 
 
     items: list[dict[str, Any]] = []
     if groups:
+        # 每条笔记的 haystack 只构建一次：此前是 O(关键词数 × 笔记数) 次
+        # json.dumps(raw_json)，raw_json 是完整上游响应（几十 KB/条）
+        haystacks = {note.id: _note_haystack(note) for note in notes}
         for group in groups:
             for keyword in group.keywords or []:
                 keyword_text = str(keyword).strip()
                 if not keyword_text:
                     continue
-                matched = [note for note in notes if _note_matches_value(note, keyword_text)]
+                needle = keyword_text.lower()
+                matched = [note for note in notes if needle in haystacks.get(note.id, "")]
                 engagement = sum(_note_metrics(note)["engagement"] for note in matched)
                 items.append(
                     {
@@ -478,7 +478,6 @@ def create_report(
         "generated_at": generated_at.isoformat(),
         "note_count": len(notes),
         "file_name": file_name,
-        "file_path": str(file_path),
         "download_url": f"/api/files/exports/{file_name}",
         "summary": report_payload["summary"],
     }

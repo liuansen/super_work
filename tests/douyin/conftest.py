@@ -33,7 +33,12 @@ def media_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def client(tmp_path, media_dir):
+def client(tmp_path, media_dir, monkeypatch):
+    # 抖音套件不测认证限流（SEC-6）：固定用户名 fixture 会在同一进程内多次注册，
+    # 必须与进程内存滑动窗口限流器隔离，避免测试结果依赖环境限流配置。
+    monkeypatch.setattr(
+        "backend.app.api.auth.check_rate_limit", lambda key, limit, now=None: True
+    )
     engine = create_engine(
         f"sqlite:///{tmp_path / 'douyin-test.db'}",
         connect_args={"check_same_thread": False},

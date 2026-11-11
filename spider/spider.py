@@ -143,13 +143,14 @@ if __name__ == '__main__':
 
 
     # 1 爬取列表的所有笔记信息 笔记链接 如下所示 注意此url会过期！
+    # 请替换为你在浏览器中复制到的最新链接（含你自己的 xsec_token）
     notes = [
-        r'https://www.xiaohongshu.com/explore/683fe17f0000000023017c6a?xsec_token=ABBr_cMzallQeLyKSRdPk9fwzA0torkbT_ubuQP1ayvKA=&xsec_source=pc_user',
+        r'https://www.xiaohongshu.com/explore/<your_note_id>?xsec_token=<your_xsec_token>&xsec_source=pc_user',
     ]
     data_spider.spider_some_note(notes, cookies_str, base_path, 'all', 'test')
 
     # 2 爬取用户的所有笔记信息 用户链接 如下所示 注意此url会过期！
-    user_url = 'https://www.xiaohongshu.com/user/profile/64c3f392000000002b009e45?xsec_token=AB-GhAToFu07JwNk_AMICHnp7bSTjVz2beVIDBwSyPwvM=&xsec_source=pc_feed'
+    user_url = 'https://www.xiaohongshu.com/user/profile/<your_user_id>?xsec_token=<your_xsec_token>&xsec_source=pc_feed'
     data_spider.spider_user_all_note(user_url, cookies_str, base_path, 'all')
 
     # 3 搜索指定关键词的笔记

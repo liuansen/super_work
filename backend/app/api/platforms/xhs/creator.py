@@ -12,13 +12,21 @@ from sqlalchemy.orm import Session
 from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
 from backend.app.api.tasks import serialize_task
 from backend.app.core.database import get_db
-from backend.app.core.deps import get_current_user
-from backend.app.core.media_source import InvalidMediaSource, validate_media_source
+from backend.app.core.deps import app_access_required, get_current_user
+from backend.app.core.media_source import (
+    InvalidMediaSource,
+    validate_media_source,
+    validate_owned_media_source,
+)
 from backend.app.core.security import decrypt_text
 from backend.app.core.time import to_naive_shanghai
 from backend.app.models import AccountCookieVersion, PlatformAccount, Task, User
 
-router = APIRouter(prefix="/xhs/creator", tags=["xhs-creator"])
+router = APIRouter(
+    prefix="/xhs/creator",
+    tags=["xhs-creator"],
+    dependencies=[Depends(app_access_required("xhs"))],
+)
 
 
 class CreatorKeywordRequest(BaseModel):
@@ -243,6 +251,11 @@ def upload_asset(
     adapter_factory=Depends(get_creator_api_adapter_factory),
 ):
     account, adapter = _adapter_for_account(db, current_user, payload.account_id, adapter_factory)
+    # SEC-2：本地素材必须归属当前用户，否则用户 A 可提交 xhs-upload-u{B}-* 读走 B 的媒体
+    try:
+        validate_owned_media_source(payload.file_path, current_user.id)
+    except InvalidMediaSource as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     task = _create_operation_task(
         db,
         current_user,

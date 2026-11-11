@@ -32,7 +32,7 @@ class PlatformMeta:
 
 _PLATFORMS: List[PlatformMeta] = [
     PlatformMeta(PlatformId.XHS, "小红书", "XiaoHongShu", True, "enabled", "#ff2442", "xhs"),
-    PlatformMeta(PlatformId.DOUYIN, "抖音", "Douyin", False, "coming_soon", "#111111", "douyin"),
+    PlatformMeta(PlatformId.DOUYIN, "抖音", "Douyin", True, "enabled", "#111111", "douyin"),
     PlatformMeta(PlatformId.KUAISHOU, "快手", "Kuaishou", False, "coming_soon", "#ff7a00", "kuaishou"),
     PlatformMeta(PlatformId.WEIBO, "微博", "Weibo", False, "coming_soon", "#e6162d", "weibo"),
     PlatformMeta(PlatformId.XIANYU, "闲鱼", "Xianyu", False, "coming_soon", "#ffe100", "xianyu"),

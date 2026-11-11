@@ -8,7 +8,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
@@ -33,13 +33,10 @@ from backend.app.models import (
 
 
 def _cookies_to_string(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return stripped
-    if stripped.startswith("{"):
-        cookies = json.loads(stripped)
-        return "; ".join(f"{key}={cookie_value}" for key, cookie_value in cookies.items())
-    return stripped
+    """Cookie 文本 → `k=v; k=v` 头（统一实现见 account_service）。"""
+    from backend.app.services.account_service import cookie_header_from_text
+
+    return cookie_header_from_text(value)
 
 
 def _latest_account_cookies(db: Session, account_id: int) -> str:
@@ -196,6 +193,24 @@ def _run_one_due_publish_job(db: Session, current_user: User, job: PublishJob, a
             task.status = "failed"
             task.progress = 100
             task.payload = {**(task.payload or {}), "error": str(exc)}
+        # SCH-5 对等：定时发布失败此前只写库，用户不主动看任务列表就不知道，
+        # 与 auto task 路径的 _record_auto_task_failure 不对称。
+        try:
+            from backend.app.services.notification_service import notify_publish_failed
+
+            notify_publish_failed(
+                db,
+                current_user.id,
+                # Notification.title 是 String(256)：PublishJob.title 最长 256，
+                # 拼上「发布失败: 」前缀会溢出，MySQL strict 模式下 flush 抛错
+                # 会连带让上面的失败状态无法落库。这里先截断。
+                (job.title or f"任务 #{job.id}")[:240],
+                job.id,
+                task_id=task.id if task is not None else None,
+                error=str(exc),
+            )
+        except Exception:  # 通知失败不能影响失败状态落库
+            logger.warning("写入发布失败通知失败: job=%s", job.id, exc_info=True)
         db.commit()
         db.refresh(job)
         return "failed", _serialize_publish_job(job)
@@ -414,17 +429,49 @@ def _note_matches_target(note: Note, target: MonitoringTarget) -> bool:
     return needle in _note_haystack(note)
 
 
+# PERF-1：单个目标参与匹配计算的笔记上限（内存快照不随全库线性增长）
+MONITORING_MATCH_NOTE_LIMIT = 2000
+# PERF-1：每个目标的快照保留条数（超过则清理最旧的）
+MONITORING_SNAPSHOT_KEEP = 100
+
+
 def _matching_notes_for_target(db: Session, target: MonitoringTarget, platform: str) -> list[Note]:
-    notes = db.scalars(
-        select(Note)
-        .where(
-            Note.user_id == target.user_id,
-            Note.platform == platform,
-        )
-        .order_by(Note.created_at.desc(), Note.id.desc())
-    ).all()
-    matched = [note for note in notes if _note_matches_target(note, target)]
+    """先在 SQL 里预过滤关键词，再在 Python 中精筛。
+
+    统一走 services/note_search：检索列是写入时算好的 ``notes.search_text``
+    （SQLite 上还有 FTS5 trigram 索引），不再对 raw_json 做 json.dumps + LIKE。
+    """
+    from backend.app.services.note_search import candidate_notes, note_matches
+
+    needle = target.value.strip()
+    if not needle:
+        return []
+    candidates = candidate_notes(
+        db,
+        user_id=target.user_id,
+        platform=platform,
+        needle=needle,
+        limit=MONITORING_MATCH_NOTE_LIMIT,
+    )
+    matched = [note for note in candidates if note_matches(note, needle)]
     return sorted(matched, key=lambda note: _note_metrics(note)["engagement"], reverse=True)
+
+
+def _prune_monitoring_snapshots(db: Session, target_id: int, keep: int = MONITORING_SNAPSHOT_KEEP) -> int:
+    """PERF-1：快照保留策略——每目标只保留最近 N 条。"""
+    stale_ids = db.scalars(
+        select(MonitoringSnapshot.id)
+        .where(MonitoringSnapshot.target_id == target_id)
+        .order_by(MonitoringSnapshot.id.desc())
+        .offset(keep)
+        .limit(1000)
+    ).all()
+    if not stale_ids:
+        return 0
+    db.execute(
+        delete(MonitoringSnapshot).where(MonitoringSnapshot.id.in_(stale_ids))
+    )
+    return len(stale_ids)
 
 
 def _refresh_monitoring_target(db: Session, target: MonitoringTarget, now: datetime, platform: str) -> dict[str, Any]:
@@ -438,6 +485,9 @@ def _refresh_monitoring_target(db: Session, target: MonitoringTarget, now: datet
     target.updated_at = now
     snapshot = MonitoringSnapshot(target_id=target.id, payload=snapshot_payload)
     db.add(snapshot)
+    db.flush()
+    # PERF-1：快照保留策略，防止每天 14.4 万行的无限增长
+    _prune_monitoring_snapshots(db, target.id)
     db.flush()
 
     task = Task(
@@ -520,27 +570,94 @@ def _get_text_model_for_user(db: Session, user_id: int):
 
 
 def _scheduler_cookies_to_string(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return stripped
-    if stripped.startswith("{"):
-        cookies = json.loads(stripped)
-        return "; ".join(f"{k}={v}" for k, v in cookies.items())
-    return stripped
+    """兼容旧调用点：与 _cookies_to_string 共用同一实现。"""
+    return _cookies_to_string(value)
+
+
+AUTO_TASK_CLAIM_STALE_MINUTES = 30
+
+
+def _claim_auto_task(db: Session, task_id: int, *, now: Optional[datetime] = None) -> bool:
+    """SCH-2：原子领取自动运营任务。
+
+    条件 UPDATE：仅当任务 active 且未被领取（或领取已超时）时置 claimed_at。
+    防止调度器 tick 与手动运行并发重复执行同一任务。
+    """
+    now = now or shanghai_now()
+    stale_cutoff = now - timedelta(minutes=AUTO_TASK_CLAIM_STALE_MINUTES)
+    claimed = db.execute(
+        update(AutoTask)
+        .where(
+            AutoTask.id == task_id,
+            AutoTask.status == "active",
+            or_(AutoTask.claimed_at.is_(None), AutoTask.claimed_at <= stale_cutoff),
+        )
+        .values(claimed_at=now)
+    )
+    db.commit()
+    return claimed.rowcount == 1
+
+
+def _release_auto_task_claim(db: Session, task_id: int) -> None:
+    try:
+        fresh = db.get(AutoTask, task_id)
+        if fresh is not None:
+            fresh.claimed_at = None
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _record_auto_task_failure(db: Session, task: AutoTask, reason: str) -> None:
+    """SCH-5：自动运营的每次失败都写 Task 审计记录 + 用户通知，不再静默。"""
+    task.last_run_at = shanghai_now()
+    db.add(
+        Task(
+            user_id=task.user_id,
+            platform="xhs",
+            task_type="auto_ops_run",
+            status="failed",
+            progress=100,
+            error_type="auto_task",
+            payload={
+                "auto_task_id": task.id,
+                "auto_task_name": task.name,
+                "error": reason[:500],
+            },
+        )
+    )
+    db.add(
+        Notification(
+            user_id=task.user_id,
+            title="自动运营运行失败",
+            body=f"任务「{task.name}」本次运行失败：{reason[:200]}",
+            level="warning",
+        )
+    )
+    db.commit()
 
 
 def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
-    """Simplified auto-task execution for background scheduler."""
+    """Simplified auto-task execution for background scheduler.
+
+    事务边界（SCH-2/P0-5）：
+    1. 素材上传完成、任务置 publishing 后先提交，再做发布网络调用；
+    2. 发布结果用独立事务提交——外部发布成功后任何本地失败都不会导致重复发布。
+    所有提前失败路径写 Task + Notification（SCH-5），不再静默返回。
+    """
     import random
 
     from backend.app.adapters.xhs.pc_api_adapter import XhsPcApiAdapter
-    from backend.app.api.platforms.xhs.crawl import _data_items
-    from backend.app.api.platforms.xhs.pc import _normalize_search_item
+    from backend.app.services.xhs_normalizers import (
+        data_items as _data_items,
+        normalize_search_item as _normalize_search_item,
+    )
     from backend.app.services.ai_service import OpenAICompatibleTextClient
 
     # Get PC cookies
     account = db.get(PlatformAccount, task.pc_account_id)
     if not account:
+        _record_auto_task_failure(db, task, "未找到可用的 PC 账号")
         return
     cookie_version = db.scalars(
         select(AccountCookieVersion)
@@ -548,24 +665,32 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
         .order_by(AccountCookieVersion.created_at.desc())
     ).first()
     if not cookie_version:
+        _record_auto_task_failure(db, task, "PC 账号没有可用的 Cookie 版本")
         return
     cookies = _scheduler_cookies_to_string(decrypt_text(cookie_version.encrypted_cookies))
 
     # Pick keyword
     keywords = task.keywords or []
     if not keywords:
+        _record_auto_task_failure(db, task, "未配置关键词")
         return
     keyword = random.choice(keywords)
 
     # Search
     adapter = XhsPcApiAdapter(cookies)
-    success, message, raw = adapter.search_note(keyword, page=1)
+    try:
+        success, message, raw = adapter.search_note(keyword, page=1)
+    except Exception as exc:
+        _record_auto_task_failure(db, task, f"搜索异常: {exc}")
+        return
     if not success:
+        _record_auto_task_failure(db, task, f"搜索失败: {message or '未知错误'}")
         return
 
     items = _data_items(raw)
     normalized = [_normalize_search_item(item) for item in items[:10]]
     if not normalized:
+        _record_auto_task_failure(db, task, f"关键词「{keyword}」没有搜索到可用笔记")
         return
 
     # Pick best
@@ -620,6 +745,8 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
     # Get Creator cookies
     creator_account = db.get(PlatformAccount, task.creator_account_id)
     if not creator_account:
+        db.rollback()
+        _record_auto_task_failure(db, task, "未找到可用的 Creator 账号")
         return
     creator_cv = db.scalars(
         select(AccountCookieVersion)
@@ -627,6 +754,8 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
         .order_by(AccountCookieVersion.created_at.desc())
     ).first()
     if not creator_cv:
+        db.rollback()
+        _record_auto_task_failure(db, task, "Creator 账号没有可用的 Cookie 版本")
         return
     creator_cookies = _scheduler_cookies_to_string(decrypt_text(creator_cv.encrypted_cookies))
 
@@ -646,9 +775,11 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
             logger.warning(f"Auto task {task.id} image upload failed: {exc}")
 
     if not file_infos:
+        db.rollback()
+        _record_auto_task_failure(db, task, "源笔记图片上传到创作平台全部失败")
         return
 
-    # Create publish job
+    # Create publish job：先提交 publishing 状态，再做发布网络调用（SCH-2）
     job = PublishJob(
         user_id=task.user_id,
         platform_account_id=task.creator_account_id,
@@ -672,9 +803,9 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
             creator_media_id=str(info.get("fileIds", "") or ""),
             creator_upload_info=json.dumps(info, ensure_ascii=False, default=str),
         ))
-    db.flush()
+    db.commit()
 
-    # Publish via Creator API
+    # Publish via Creator API（结果用独立事务提交）
     try:
         note_info = {
             "title": job.title,
@@ -700,8 +831,14 @@ def _execute_auto_task_background(db: Session, task: AutoTask) -> None:
 
     if job.status == "published":
         task.total_published = (task.total_published or 0) + 1
-    task.last_run_at = shanghai_now()
-    logger.info(f"Auto task {task.id} executed: keyword={keyword}, job={job.id}, status={job.status}")
+        task.last_run_at = shanghai_now()
+        db.commit()
+        logger.info(f"Auto task {task.id} executed: keyword={keyword}, job={job.id}, status={job.status}")
+    else:
+        publish_error = job.publish_error
+        db.commit()
+        task.last_run_at = shanghai_now()
+        _record_auto_task_failure(db, task, f"发布失败: {publish_error}")
 
 
 def run_due_auto_tasks() -> None:
@@ -720,26 +857,65 @@ def run_due_auto_tasks() -> None:
         ).all()
 
         for task in due_tasks:
-            # 每个任务独立事务：远端发布成功后立即提交，
-            # 避免整批共用一次 commit 导致“已发布但回滚→下个 tick 重复发布”。
+            # SCH-2：先原子领取并提交，再执行——并发 tick / 手动运行只有一个能执行
+            if not _claim_auto_task(db, task.id, now=now):
+                continue
             try:
                 _execute_auto_task_background(db, task)
-                db.commit()
             except Exception as exc:
                 db.rollback()
                 logger.warning(f"Auto task {task.id} execution failed: {exc}")
-            try:
-                db.refresh(task)
-                _calculate_next_run_at(task)
-                db.commit()
-            except Exception as exc:
-                db.rollback()
-                logger.warning(f"Auto task {task.id} next-run reschedule failed: {exc}")
+                _record_auto_task_failure(db, task, f"执行异常: {exc}")
+            finally:
+                # review P3：排期推进必须发生在释放 claim 之前。若先释放再推进，
+                # 中间存在「claim 已释放且 next_run_at 仍在过去」的窗口，并发 tick
+                # 会再次领取执行（等于重复发布）。持有 claim 期间推进，窗口为零。
+                try:
+                    db.refresh(task)
+                    _calculate_next_run_at(task)
+                    db.commit()
+                except Exception as exc:
+                    db.rollback()
+                    logger.warning(f"Auto task {task.id} next-run reschedule failed: {exc}")
+                    # review P1：排期推进失败时 next_run_at 会滞留在过去，若继续 active
+                    # 就会每个 tick 重复执行（等于重复发布）。这里直接暂停任务并通知用户。
+                    try:
+                        stale = db.get(AutoTask, task.id)
+                        if stale is not None:
+                            stale.status = "paused"
+                            stale.next_run_at = None
+                            db.commit()
+                            _record_auto_task_failure(
+                                db, stale, f"排期计算失败，已自动暂停: {exc}"
+                            )
+                    except Exception:
+                        db.rollback()
+                        logger.exception(f"Auto task {task.id} pause after reschedule failure failed")
+                _release_auto_task_claim(db, task.id)
     except Exception as exc:
         db.rollback()
         logger.error(f"run_due_auto_tasks failed: {exc}")
     finally:
         db.close()
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """区分认证失败与网络/上游错误（BE-5）。
+
+    认证失败（登录态失效）才把账号标记为 expired；网络抖动保留原状态。
+    """
+    text = str(exc).lower()
+    # review P2-8：去掉过宽的 "cookie" 标记——网络错误信息里出现 cookie 字样
+    # 不代表登录态失效，误判会批量置 expired 并轰炸通知
+    auth_markers = (
+        "401", "403", "unauthorized", "forbidden", "login", "auth",
+        "登录", "未登录", "失效", "过期", "权限", "invalid session",
+        "web_session",
+    )
+    network_markers = ("timeout", "timed out", "connection", "network", "dns", "ssl", "proxy", "超时", "网络")
+    if any(marker in text for marker in network_markers) and not any(marker in text for marker in ("登录", "login", "auth", "失效")):
+        return False
+    return any(marker in text for marker in auth_markers)
 
 
 def _check_single_account(db: Session, account: PlatformAccount, now: datetime) -> str:
@@ -772,8 +948,13 @@ def _check_single_account(db: Session, account: PlatformAccount, now: datetime) 
         return old_status
     except Exception as exc:
         old_status = account.status
-        account.status = "expired"
-        account.status_message = str(exc)
+        if _is_auth_failure(exc):
+            # 仅认证失败才置 expired（BE-5）：网络抖动不应批量制造“过期”
+            account.status = "expired"
+            account.status_message = str(exc)[:300]
+        else:
+            # 网络错误：保留原状态，仅记录最近一次错误信息
+            account.status_message = f"网络错误（状态保持 {account.status or 'unknown'}）: {exc}"[:300]
         account.updated_at = now
         return old_status
 
@@ -783,7 +964,12 @@ def check_all_account_cookies_once() -> None:
     db = SessionLocal()
     try:
         now = shanghai_now()
-        accounts = db.scalars(select(PlatformAccount).order_by(PlatformAccount.id.asc())).all()
+        # BE-5：只检查 XHS 账号——适配器只实现了 xhs 的登录态校验
+        accounts = db.scalars(
+            select(PlatformAccount)
+            .where(PlatformAccount.platform == "xhs")
+            .order_by(PlatformAccount.id.asc())
+        ).all()
         checked = 0
         newly_expired = 0
         for account in accounts:
@@ -806,6 +992,50 @@ def check_all_account_cookies_once() -> None:
         logger.error(f"check_all_account_cookies_once failed: {exc}")
     finally:
         db.close()
+
+
+def run_reconcile_once() -> None:
+    """周期对账：复位进程崩溃/挂死时滞留在 publishing/uploading 的任务。"""
+    try:
+        publish_result = reconcile_stale_publish_jobs()
+        from backend.app.douyin.publishing import reconcile_stale_tasks
+
+        task_reset = reconcile_stale_tasks() or 0
+        if publish_result.get("reset_publish_jobs") or task_reset:
+            logger.info(
+                "周期对账完成: publish_jobs=%s, douyin_tasks=%s",
+                publish_result,
+                task_reset,
+            )
+    except Exception as exc:
+        logger.error(f"run_reconcile_once failed: {exc}")
+
+
+def _run_sqlite_backup() -> None:
+    from backend.app.services.backup import run_sqlite_backup_once
+
+    try:
+        run_sqlite_backup_once()
+    except Exception as exc:
+        logger.error(f"sqlite backup failed: {exc}")
+
+
+def _run_clip_cleanup() -> None:
+    from backend.app.clip.cleanup import run_clip_cleanup_once
+
+    try:
+        run_clip_cleanup_once()
+    except Exception as exc:
+        logger.error(f"clip cleanup failed: {exc}")
+
+
+def _run_media_prune() -> None:
+    from backend.app.services.media_cleanup import run_media_prune_once
+
+    try:
+        run_media_prune_once()
+    except Exception as exc:
+        logger.error(f"media prune failed: {exc}")
 
 
 def build_due_publish_scheduler(interval_seconds: int, job_func, monitoring_job_func=None) -> BackgroundScheduler:
@@ -845,6 +1075,47 @@ def build_due_publish_scheduler(interval_seconds: int, job_func, monitoring_job_
         "interval",
         hours=2,
         id="cookie_health_checker",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # review P2：滞留任务对账此前只在进程启动时跑一次，长驻进程里卡死的发布任务
+    # 要等到下次重启才恢复。改为周期对账（阈值 30 分钟，不会误伤正在执行的任务）。
+    scheduler.add_job(
+        run_reconcile_once,
+        "interval",
+        minutes=10,
+        id="stale_task_reconciler",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # 媒体目录按年龄 + 容量周期清理，避免磁盘只增不减
+    scheduler.add_job(
+        _run_media_prune,
+        "interval",
+        hours=6,
+        id="media_pruner",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # 剪辑工坊：过期会话标记/清理 + 临时文件清理，每 6 小时一次
+    scheduler.add_job(
+        _run_clip_cleanup,
+        "interval",
+        hours=6,
+        id="clip_cleanup",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    # SQLite 每日在线备份（非 SQLite 后端自动跳过）
+    scheduler.add_job(
+        _run_sqlite_backup,
+        "interval",
+        hours=24,
+        id="sqlite_backup",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

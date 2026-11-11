@@ -199,3 +199,30 @@ def test_repeated_invalid_bind_reuses_single_row(client, auth_headers):
     assert "bbbb" not in str(first)  # 响应不含 cookie
     rows = client.get("/api/douyin/accounts", headers=auth_headers).json()
     assert len(rows) == 1
+
+
+def test_idempotent_replay_is_order_sensitive_for_images(client, auth_headers, account_id, media_dir):
+    """同幂等键 + 图集页序重排 = 异载荷 → 409；完全相同则幂等返回原任务。"""
+    (media_dir / "xhs-upload-u1-fakeimg2.jpg").write_bytes(b"fake-image-bytes-2")
+    images = ["xhs-upload-u1-fakeimg.jpg", "xhs-upload-u1-fakeimg2.jpg"]
+
+    first = _create(
+        client, auth_headers, account_id, key="img-order-key-001", kind="images", media=images
+    )
+    assert first.status_code == 200, first.text
+    task_id = first.json()["task"]["id"]
+
+    # 完全相同（含顺序）→ 幂等
+    same = _create(
+        client, auth_headers, account_id, key="img-order-key-001", kind="images", media=images
+    )
+    assert same.status_code == 200
+    assert same.json()["created"] is False
+    assert same.json()["task"]["id"] == task_id
+
+    # 仅页序不同 → 同键异载荷 409
+    reordered = list(reversed(images))
+    conflict = _create(
+        client, auth_headers, account_id, key="img-order-key-001", kind="images", media=reordered
+    )
+    assert conflict.status_code == 409

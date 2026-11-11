@@ -11,13 +11,13 @@ from sqlalchemy.orm import Session
 
 from backend.app.adapters.xhs.creator_api_adapter import XhsCreatorApiAdapter
 from backend.app.core.database import get_db
-from backend.app.core.media_source import InvalidMediaSource, validate_media_source
+from backend.app.core.media_source import InvalidMediaSource, validate_media_source, validate_owned_media_source
 from backend.app.core.time import to_naive_shanghai
 from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.core.time import shanghai_now
 from backend.app.models import AccountCookieVersion, PlatformAccount, PublishAsset, PublishJob, Task, User
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 
 router = APIRouter(prefix="/publish", tags=["publish"])
 
@@ -152,11 +152,19 @@ def serialize_publish_asset(asset: PublishAsset) -> dict:
         creator_upload_info = json.loads(asset.creator_upload_info or "{}")
     except json.JSONDecodeError:
         creator_upload_info = {}
+    source = asset.file_path or ""
+    if source.startswith(("http://", "https://")):
+        display_url = source
+    elif source:
+        display_url = f"/api/files/media/{source}"
+    else:
+        display_url = ""
     return {
         "id": asset.id,
         "publish_job_id": asset.publish_job_id,
         "asset_type": asset.asset_type,
         "file_path": asset.file_path,
+        "download_url": display_url,
         "upload_status": asset.upload_status,
         "creator_media_id": asset.creator_media_id,
         "upload_error": asset.upload_error,
@@ -165,13 +173,10 @@ def serialize_publish_asset(asset: PublishAsset) -> dict:
 
 
 def _cookies_to_string(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return stripped
-    if stripped.startswith("{"):
-        cookies = json.loads(stripped)
-        return "; ".join(f"{key}={cookie_value}" for key, cookie_value in cookies.items())
-    return stripped
+    """Cookie 文本 → `k=v; k=v` 头（统一实现见 account_service）。"""
+    from backend.app.services.account_service import cookie_header_from_text
+
+    return cookie_header_from_text(value)
 
 
 def _extract_creator_media_id(payload: dict[str, Any]) -> str:
@@ -203,6 +208,148 @@ def _scheduled_post_time(job: PublishJob) -> Optional[int]:
     # scheduled_at 为 naive 北京时间；显式挂 +08:00 再取时间戳，避免按服务器本地时区解释
     beijing = timezone(timedelta(hours=8))
     return int(job.scheduled_at.replace(tzinfo=beijing).timestamp() * 1000)
+
+
+def _assert_asset_source_owned(asset: PublishAsset, user_id: int) -> None:
+    """使用素材前惰性校验来源（存量数据可能早于归属校验上线）。
+
+    校验失败时把素材标记为 failed，并抛出 400 让调用方得到可读错误。
+    """
+    try:
+        validate_owned_media_source(asset.file_path, user_id)
+    except InvalidMediaSource as exc:
+        asset.upload_status = "failed"
+        asset.upload_error = f"素材来源校验失败: {exc}"[:500]
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def execute_claimed_publish_job(
+    db: Session,
+    *,
+    job: PublishJob,
+    account: PlatformAccount,
+    current_user: User,
+    adapter_factory,
+) -> None:
+    """执行一个已领取（publishing）的发布任务：上传素材 → 调 Creator API → 落结果。
+
+    供手动发布端点与自动运营手动运行共用（SCH-1/5）。调用方必须已经用
+    条件 UPDATE 完成原子领取并提交，且发起网络请求前所有状态已落库。
+    """
+    assets = db.scalars(
+        select(PublishAsset).where(PublishAsset.publish_job_id == job.id).order_by(PublishAsset.id.asc())
+    ).all()
+    if not assets:
+        job.status = "failed"
+        job.publish_error = "至少需要一个素材"
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="至少需要一个素材")
+
+    cookies = _get_latest_account_cookies(db, account.id)
+    adapter = adapter_factory(cookies)
+
+    for asset in assets:
+        if asset.upload_status in ("pending", "failed"):
+            try:
+                _assert_asset_source_owned(asset, current_user.id)
+            except HTTPException:
+                # 任务已被领取为 publishing，校验失败必须同步落失败状态，
+                # 否则任务会滞留中间态直到对账回收
+                job.status = "failed"
+                job.publish_error = f"素材来源校验失败: {asset.upload_error}"[:500]
+                db.commit()
+                raise
+            try:
+                payload = adapter.upload_media(asset.file_path, asset.asset_type)
+                asset.upload_status = "uploaded"
+                asset.creator_media_id = _extract_creator_media_id(payload)
+                asset.creator_upload_info = json.dumps(payload, ensure_ascii=False)
+                asset.upload_error = ""
+            except Exception as exc:
+                asset.upload_status = "failed"
+                asset.upload_error = str(exc)[:500]
+                job.status = "failed"
+                job.publish_error = f"素材上传失败: {exc}"[:500]
+                db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"素材上传失败: {exc}",
+                ) from exc
+    db.commit()
+
+    uploaded_images = [a for a in assets if a.asset_type == "image" and a.upload_status == "uploaded"]
+    uploaded_videos = [a for a in assets if a.asset_type == "video" and a.upload_status == "uploaded"]
+
+    def _fail_and_raise(detail: str) -> None:
+        # review P1-2：任务已被领取为 publishing，确定性失败必须同步落 failed，
+        # 否则用户重试永远 409，直到进程重启触发对账
+        job.status = "failed"
+        job.publish_error = detail[:500]
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+    if not uploaded_images and not uploaded_videos:
+        _fail_and_raise("没有成功上传的素材")
+
+    if uploaded_videos:
+        _fail_and_raise("视频发布功能即将上线，目前仅支持图片发布")
+
+    image_file_infos = [_asset_creator_upload_info(asset) for asset in uploaded_images]
+
+    note_info = {
+        "title": job.title,
+        "desc": job.body,
+        "media_type": "image",
+        "image_file_infos": image_file_infos,
+        "type": 1,
+        "postTime": _scheduled_post_time(job),
+    }
+    _apply_publish_options(note_info, _load_publish_options(job))
+
+    task = Task(
+        user_id=current_user.id,
+        platform=job.platform,
+        task_type="creator_publish",
+        status="running",
+        progress=20,
+        payload={
+            "publish_job_id": job.id,
+            "platform_account_id": account.id,
+            "asset_ids": [asset.id for asset in uploaded_images],
+            "publish_mode": job.publish_mode,
+        },
+    )
+    db.add(task)
+    db.commit()
+
+    try:
+        payload = adapter_factory(cookies).post_note(note_info)
+        job.status = "scheduled" if job.publish_mode == "scheduled" else "published"
+        job.external_note_id = _extract_external_note_id(payload)
+        job.publish_error = ""
+        job.published_at = shanghai_now()
+        task.status = "completed"
+        task.progress = 100
+        task.payload = {
+            **(task.payload or {}),
+            "external_note_id": job.external_note_id,
+            "published_at": job.published_at.isoformat(),
+        }
+        db.commit()
+        db.refresh(job)
+    except Exception as exc:
+        db.rollback()
+        job = db.get(PublishJob, job.id)
+        task = db.get(Task, task.id)
+        job.status = "failed"
+        job.publish_error = str(exc)[:500]
+        if task is not None:
+            task.status = "failed"
+            task.progress = 100
+            task.payload = {**(task.payload or {}), "error": str(exc)[:500]}
+        db.commit()
+        db.refresh(job)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=job.publish_error)
 
 
 def _asset_creator_upload_info(asset: PublishAsset) -> dict[str, Any]:
@@ -280,8 +427,15 @@ def get_publish_jobs(
     )
     if platform:
         statement = statement.where(PublishJob.platform == platform)
-    jobs = db.scalars(statement.order_by(PublishJob.created_at.desc(), PublishJob.id.desc())).all()
-    return paginated([serialize_publish_job(job) for job in jobs], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        statement,
+        page=page,
+        page_size=page_size,
+        serializer=serialize_publish_job,
+        order_by=(PublishJob.created_at.desc(), PublishJob.id.desc()),
+    )
 
 
 @router.get("/jobs/{job_id}")
@@ -305,6 +459,12 @@ def update_publish_job(
         account = db.get(PlatformAccount, payload.platform_account_id)
         if account is None or account.user_id != current_user.id or account.platform != job.platform:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Platform account not found")
+        # SCH-3：改绑必须是 Creator 子类型账号，否则任务到期执行时必然失败并阻塞队列
+        if account.sub_type != "creator":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Publish jobs require a Creator (creator) account",
+            )
         job.platform_account_id = account.id
     if payload.title is not None:
         job.title = payload.title
@@ -314,6 +474,18 @@ def update_publish_job(
         job.publish_mode = payload.publish_mode
     if payload.scheduled_at is not None or payload.publish_mode == "immediate":
         job.scheduled_at = payload.scheduled_at
+    # SCH-6：scheduled 模式的交叉字段校验——没有未来时间的 scheduled 任务会永远滞留 pending
+    if job.publish_mode == "scheduled":
+        if job.scheduled_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="scheduled 发布模式必须提供未来的 scheduled_at",
+            )
+        if job.scheduled_at <= shanghai_now():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="scheduled_at 必须晚于当前时间",
+            )
     _update_publish_options(job, payload)
 
     db.commit()
@@ -368,7 +540,6 @@ def delete_publish_job(
     if job.status in {"publishing", "uploading"}:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="正在进行中的任务无法删除")
 
-    db.execute(select(PublishAsset).where(PublishAsset.publish_job_id == job.id))
     for asset in db.scalars(select(PublishAsset).where(PublishAsset.publish_job_id == job.id)).all():
         db.delete(asset)
     db.delete(job)
@@ -385,10 +556,15 @@ def get_publish_assets(
     db: Session = Depends(get_db),
 ):
     job = _get_owned_publish_job(db, current_user, job_id)
-    assets = db.scalars(
-        select(PublishAsset).where(PublishAsset.publish_job_id == job.id).order_by(PublishAsset.id.asc())
-    ).all()
-    return paginated([serialize_publish_asset(asset) for asset in assets], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        select(PublishAsset).where(PublishAsset.publish_job_id == job.id),
+        page=page,
+        page_size=page_size,
+        serializer=serialize_publish_asset,
+        order_by=PublishAsset.id.asc(),
+    )
 
 
 @router.post("/jobs/{job_id}/assets")
@@ -399,7 +575,12 @@ def create_publish_asset(
     db: Session = Depends(get_db),
 ):
     job = _get_owned_publish_job(db, current_user, job_id)
-    asset = PublishAsset(publish_job_id=job.id, asset_type=payload.asset_type, file_path=payload.file_path)
+    # 本地文件名必须属于当前用户（防跨用户引用他人媒体；URL 走白名单校验）
+    try:
+        validated_source = validate_owned_media_source(payload.file_path, current_user.id)
+    except InvalidMediaSource as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    asset = PublishAsset(publish_job_id=job.id, asset_type=payload.asset_type, file_path=validated_source)
     db.add(asset)
     db.commit()
     db.refresh(asset)
@@ -437,6 +618,7 @@ def upload_publish_asset(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Creator account required")
 
     cookies = _get_latest_account_cookies(db, account.id)
+    _assert_asset_source_owned(asset, current_user.id)
     asset.upload_status = "uploading"
     asset.upload_error = ""
     db.commit()
@@ -498,101 +680,7 @@ def publish_job_to_creator(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Publish job is already completed or in progress")
     db.refresh(job)
 
-    assets = db.scalars(
-        select(PublishAsset).where(PublishAsset.publish_job_id == job.id).order_by(PublishAsset.id.asc())
-    ).all()
-    if not assets:
-        job.status = "failed"
-        job.publish_error = "至少需要一个素材"
-        db.commit()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="至少需要一个素材")
-
-    cookies = _get_latest_account_cookies(db, account.id)
-    adapter = adapter_factory(cookies)
-
-    for asset in assets:
-        if asset.upload_status in ("pending", "failed"):
-            try:
-                payload = adapter.upload_media(asset.file_path, asset.asset_type)
-                asset.upload_status = "uploaded"
-                asset.creator_media_id = _extract_creator_media_id(payload)
-                asset.creator_upload_info = json.dumps(payload, ensure_ascii=False)
-                asset.upload_error = ""
-            except Exception as exc:
-                asset.upload_status = "failed"
-                asset.upload_error = str(exc)[:500]
-                job.status = "failed"
-                job.publish_error = f"素材上传失败: {exc}"[:500]
-                db.commit()
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"素材上传失败: {exc}",
-                ) from exc
-    db.commit()
-
-    uploaded_images = [a for a in assets if a.asset_type == "image" and a.upload_status == "uploaded"]
-    uploaded_videos = [a for a in assets if a.asset_type == "video" and a.upload_status == "uploaded"]
-
-    if not uploaded_images and not uploaded_videos:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="没有成功上传的素材")
-
-    if uploaded_videos:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="视频发布功能即将上线，目前仅支持图片发布")
-
-    image_file_infos = [_asset_creator_upload_info(asset) for asset in uploaded_images]
-
-    note_info = {
-        "title": job.title,
-        "desc": job.body,
-        "media_type": "image",
-        "image_file_infos": image_file_infos,
-        "type": 1,
-        "postTime": _scheduled_post_time(job),
-    }
-    _apply_publish_options(note_info, _load_publish_options(job))
-
-    task = Task(
-        user_id=current_user.id,
-        platform=job.platform,
-        task_type="creator_publish",
-        status="running",
-        progress=20,
-        payload={
-            "publish_job_id": job.id,
-            "platform_account_id": account.id,
-            "asset_ids": [asset.id for asset in uploaded_images],
-            "publish_mode": job.publish_mode,
-        },
-    )
-    db.add(task)
-    db.commit()
-
-    try:
-        payload = adapter_factory(cookies).post_note(note_info)
-        job.status = "scheduled" if job.publish_mode == "scheduled" else "published"
-        job.external_note_id = _extract_external_note_id(payload)
-        job.publish_error = ""
-        job.published_at = shanghai_now()
-        task.status = "completed"
-        task.progress = 100
-        task.payload = {
-            **(task.payload or {}),
-            "external_note_id": job.external_note_id,
-            "published_at": job.published_at.isoformat(),
-        }
-        db.commit()
-        db.refresh(job)
-        return serialize_publish_job(job)
-    except Exception as exc:
-        db.rollback()
-        job = _get_owned_publish_job(db, current_user, job.id)
-        task = db.get(Task, task.id)
-        job.status = "failed"
-        job.publish_error = str(exc)[:500]
-        if task is not None:
-            task.status = "failed"
-            task.progress = 100
-            task.payload = {**(task.payload or {}), "error": str(exc)[:500]}
-        db.commit()
-        db.refresh(job)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=job.publish_error)
+    # 领取成功后共用同一执行器（SCH-1/5）
+    execute_claimed_publish_job(db, job=job, account=account, current_user=current_user, adapter_factory=adapter_factory)
+    db.refresh(job)
+    return serialize_publish_job(job)

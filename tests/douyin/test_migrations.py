@@ -19,6 +19,9 @@ def _run_upgrade(tmp_path, monkeypatch):
     root = Path(__file__).resolve().parents[2]
     monkeypatch.delenv("DATABASE_URL", raising=False)  # 防外部环境变量劫持迁移目标
     db_path = tmp_path / "migration-test.db"
+    # 显式指向临时库。env.py 的 URL 解析语义可能演进（DATABASE_URL →
+    # ALEMBIC_DATABASE_URL → settings.database_url），不显式设置就会迁移动真实业务库。
+    monkeypatch.setenv("ALEMBIC_DATABASE_URL", f"sqlite:///{db_path}")
     config = Config(str(root / "backend" / "alembic.ini"))
     config.set_main_option("script_location", str(root / "backend" / "alembic"))
     config.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
@@ -26,15 +29,26 @@ def _run_upgrade(tmp_path, monkeypatch):
     return db_path
 
 
+def _alembic_head(tmp_path) -> str:
+    """动态计算当前迁移链 head（硬编码版本号会随合法的新迁移漂移而误报）。"""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[2]
+    config = Config(str(root / "backend" / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "backend" / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
 def test_upgrade_creates_douyin_tables_on_empty_database(tmp_path, monkeypatch):
     db_path = _run_upgrade(tmp_path, monkeypatch)
     engine = create_engine(f"sqlite:///{db_path}")
     tables = set(inspect(engine).get_table_names())
     assert {"douyin_accounts", "douyin_reference_works", "douyin_publish_tasks", "douyin_metric_snapshots"} <= tables
-    # 版本表指向新 revision
+    # 版本表指向迁移链当前 head（动态计算）
     with engine.connect() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert version == "a1b2c3d4e5f6"
+    assert version == _alembic_head(tmp_path)
     engine.dispose()
 
 
@@ -46,6 +60,7 @@ def test_upgrade_preserves_existing_xhs_rows(tmp_path, monkeypatch):
     root = Path(__file__).resolve().parents[2]
     monkeypatch.delenv("DATABASE_URL", raising=False)
     db_path = tmp_path / "upgrade-existing.db"
+    monkeypatch.setenv("ALEMBIC_DATABASE_URL", f"sqlite:///{db_path}")  # 隔离真实业务库
 
     config = Config(str(root / "backend" / "alembic.ini"))
     config.set_main_option("script_location", str(root / "backend" / "alembic"))

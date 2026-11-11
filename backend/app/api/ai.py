@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -12,7 +12,7 @@ from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.models import AiDraft, AiGeneratedAsset, ModelConfig, Task, User
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 from backend.app.services.ai_service import ImageAiClient, OpenAICompatibleImageClient, OpenAICompatibleTextClient, TextAiClient
 
 router = APIRouter(prefix="/ai", tags=["ai"])
@@ -56,8 +56,17 @@ class GenerateCoverRequest(BaseModel):
 
 class GenerateImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
-    reference_images: list[str] = Field(default_factory=list)
+    # 参考图数量与单条长度都设上限：避免超大列表原样透传给图像端点
+    reference_images: list[str] = Field(default_factory=list, max_length=8)
     save_to_assets: bool = True
+
+    @field_validator("reference_images")
+    @classmethod
+    def _validate_reference_images(cls, value: list[str]) -> list[str]:
+        for item in value:
+            if len(item) > 4000:
+                raise ValueError("单条参考图引用长度不能超过 4000 字符")
+        return value
 
 
 class DescribeImageRequest(BaseModel):
@@ -362,17 +371,20 @@ def polish_text(
 
 @router.get("/images/assets")
 def generated_image_assets(
-    page: int = 1,
-    page_size: int = 20,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    assets = db.scalars(
-        select(AiGeneratedAsset)
-        .where(AiGeneratedAsset.user_id == current_user.id)
-        .order_by(AiGeneratedAsset.created_at.desc(), AiGeneratedAsset.id.desc())
-    ).all()
-    return paginated([_serialize_generated_asset(asset) for asset in assets], page, page_size)
+    # PERF-2：SQL 侧分页（此前全量加载后内存切片，且参数没有 422 校验）
+    return paginate_query(
+        db,
+        select(AiGeneratedAsset).where(AiGeneratedAsset.user_id == current_user.id),
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_generated_asset,
+        order_by=(AiGeneratedAsset.created_at.desc(), AiGeneratedAsset.id.desc()),
+    )
 
 
 @router.delete("/images/assets/{asset_id}")
@@ -449,6 +461,7 @@ def generate_image(
             api_key=api_key,
             prompt=payload.prompt,
             reference_images=payload.reference_images or None,
+            user_id=current_user.id,
         ),
     )
     response_data: dict = {"url": result.get("url") or "", "raw": result.get("raw")}

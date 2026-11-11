@@ -1,0 +1,8 @@
+# 仅开发/测试环境依赖：生产镜像不安装（见 Dockerfile）
+-r requirements.txt
+-r requirements-douyin.txt
+
+pytest
+# starlette TestClient 依赖 httpx
+httpx
+pytest-xdist

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>剪辑工坊 · 契约测试编辑器</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #141414; color: #e6e6e6; }
+    main { max-width: 960px; margin: 0 auto; padding: 32px 24px; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    p { color: #a6a6a6; }
+    section { background: #1f1f1f; border: 1px solid #303030; border-radius: 8px; padding: 20px; margin: 16px 0; }
+    button, input[type=file] { font: inherit; }
+    button { background: #1668dc; color: #fff; border: 0; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+    button:disabled { background: #333; color: #777; cursor: not-allowed; }
+    ul { padding-left: 20px; }
+    code { color: #9ecbff; word-break: break-all; }
+    #result { white-space: pre-wrap; background: #0a0a0a; padding: 12px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>剪辑工坊 · 契约测试编辑器</h1>
+  <p>这不是生产编辑器。它只验证工作台的会话交换、素材读取和成片回传契约；OpenCut fork 完成后替换同一入口。</p>
+  <section>
+    <p id="status">正在读取会话…</p>
+    <ul id="assets"></ul>
+    <p><label>选择一个 MP4 作为“导出的成片”：<input id="file" type="file" accept="video/mp4" disabled /></label></p>
+    <p><button id="upload" disabled>回传成片</button></p>
+    <pre id="result"></pre>
+  </section>
+</main>
+<script>
+  const apiBase = new URLSearchParams(location.search).get("api") || "http://127.0.0.1:8000";
+  const hash = new URLSearchParams(location.hash.slice(1));
+  const handoff = hash.get("handoff");
+  const sessionId = hash.get("session");
+  // 令牌只允许出现在 fragment：读取后立即从地址栏擦除（不产生历史记录）
+  history.replaceState(null, "", location.pathname + location.search);
+
+  const statusEl = document.getElementById("status");
+  const assetsEl = document.getElementById("assets");
+  const fileEl = document.getElementById("file");
+  const uploadEl = document.getElementById("upload");
+  const resultEl = document.getElementById("result");
+
+  // ===== 工作台契约（与 OpenCut fork bridge 保持同一接口）=====
+  // 1. POST {api}/api/clip/sessions/{id}/exchange   —— fragment 里的 handoff 换 12h 会话令牌
+  // 2. GET  {api}/api/clip/sessions/{id}/assets/{file_name} —— 按会话清单读取素材（支持 Range）
+  // 3. POST {api}/api/clip/exports                 —— 回传 MP4 成片（multipart: session_id/file/title/client_export_id）
+  let sessionToken = null;
+
+  function authHeaders() {
+    return { Authorization: "Bearer " + sessionToken };
+  }
+
+  async function exchange() {
+    if (!handoff || !sessionId) {
+      statusEl.textContent = "缺少会话参数，请从工作台重新进入。";
+      return;
+    }
+    const response = await fetch(apiBase + "/api/clip/sessions/" + sessionId + "/exchange", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + handoff },
+    });
+    if (!response.ok) {
+      statusEl.textContent = "会话交换失败（" + response.status + "）：" + (await response.text());
+      return;
+    }
+    const data = await response.json();
+    sessionToken = data.session_token;
+    statusEl.textContent = "会话已就绪，共 " + data.assets.length + " 个素材。";
+    for (const asset of data.assets) {
+      const li = document.createElement("li");
+      const link = document.createElement("a");
+      link.href = "#";
+      link.textContent = asset.file_name + "（" + asset.asset_type + "，" + asset.size_bytes + " 字节）";
+      link.onclick = async (event) => {
+        event.preventDefault();
+        const fileResponse = await fetch(apiBase + asset.download_path, { headers: authHeaders() });
+        if (!fileResponse.ok) {
+          resultEl.textContent = "素材读取失败：" + fileResponse.status;
+          return;
+        }
+        const blob = await fileResponse.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        window.open(blobUrl, "_blank", "noopener,noreferrer");
+      };
+      li.appendChild(link);
+      assetsEl.appendChild(li);
+    }
+    fileEl.disabled = false;
+    uploadEl.disabled = false;
+  }
+
+  uploadEl.onclick = async () => {
+    const file = fileEl.files && fileEl.files[0];
+    if (!file) {
+      resultEl.textContent = "请先选择一个 MP4 文件。";
+      return;
+    }
+    uploadEl.disabled = true;
+    try {
+      const form = new FormData();
+      form.append("session_id", sessionId);
+      form.append("file", file, file.name);
+      form.append("title", file.name.replace(/\.mp4$/i, ""));
+      form.append("client_export_id", (crypto.randomUUID
+        ? crypto.randomUUID()
+        : Array.from(crypto.getRandomValues(new Uint8Array(16)), function (b) { return b.toString(16).padStart(2, "0"); }).join("")));
+      const response = await fetch(apiBase + "/api/clip/exports", {
+        method: "POST",
+        headers: authHeaders(),
+        body: form,
+      });
+      resultEl.textContent = response.status + "\n" + (await response.text());
+    } finally {
+      uploadEl.disabled = false;
+    }
+  };
+
+  exchange().catch((error) => {
+    statusEl.textContent = "会话交换异常：" + error;
+  });
+</script>
+</body>
+</html>

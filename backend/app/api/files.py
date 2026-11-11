@@ -45,7 +45,9 @@ def _export_media_type(file_name: str) -> str:
 
 
 def _media_dir() -> Path:
-    return Path(get_settings().storage_dir) / "media"
+    from backend.app.core.media_storage import media_dir
+
+    return media_dir()
 
 
 def _owner_media_prefix(current_user: User) -> str:
@@ -55,7 +57,12 @@ def _owner_media_prefix(current_user: User) -> str:
 def _validate_owner_media_name(file_name: str, current_user: User) -> str:
     if Path(file_name).name != file_name or ".." in file_name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
-    valid_prefixes = (_owner_media_prefix(current_user), f"xhs-asset-u{current_user.id}-", f"xhs-upload-u{current_user.id}-")
+    valid_prefixes = (
+        _owner_media_prefix(current_user),
+        f"xhs-asset-u{current_user.id}-",
+        f"xhs-upload-u{current_user.id}-",
+        f"xhs-clip-u{current_user.id}-",
+    )
     if not file_name.startswith(valid_prefixes):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
     return file_name
@@ -73,13 +80,17 @@ def _media_type(file_name: str) -> str:
         return "video/mp4"
     if lower.endswith(".mov"):
         return "video/quicktime"
+    if lower.endswith(".avi"):
+        return "video/x-msvideo"
+    if lower.endswith(".mkv"):
+        return "video/x-matroska"
     return "image/png"
 
 
 def _serialize_media_file(*, file_name: str, width: int, height: int) -> dict:
+    # 不返回服务器绝对路径（BE-10 路径信息泄露），客户端一律使用 download_url
     return {
         "file_name": file_name,
-        "file_path": str(_media_dir() / file_name),
         "download_url": f"/api/files/media/{file_name}",
         "width": width,
         "height": height,
@@ -92,19 +103,47 @@ def list_user_images(current_user: User = Depends(get_current_user)):
     prefix = f"xhs-upload-u{current_user.id}-"
     media_dir = _media_dir()
     image_exts = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-    files = []
+    entries: list[tuple[float, str, int]] = []
     if media_dir.is_dir():
-        for f in sorted(media_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-            if f.name.startswith(prefix) and f.suffix.lower() in image_exts:
-                files.append({"file_name": f.name, "url": f"/api/files/media/{f.name}", "size": f.stat().st_size})
-    return {"items": files}
+        # os.scandir + entry.stat()：一次遍历拿全属性，
+        # 不像 iterdir()+stat() 那样每个文件两次系统调用
+        import os
+
+        try:
+            with os.scandir(media_dir) as iterator:
+                for entry in iterator:
+                    if not entry.name.startswith(prefix):
+                        continue
+                    if os.path.splitext(entry.name)[1].lower() not in image_exts:
+                        continue
+                    try:
+                        if not entry.is_file():
+                            continue
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    entries.append((st.st_mtime, entry.name, st.st_size))
+        except OSError:
+            entries = []
+    entries.sort(key=lambda item: item[0], reverse=True)
+    return {
+        "items": [
+            {"file_name": name, "url": f"/api/files/media/{name}", "size": size}
+            for _mtime, name, size in entries
+        ]
+    }
 
 
 @router.delete("/images/{file_name}")
 def delete_user_image(file_name: str, current_user: User = Depends(get_current_user)):
-    prefix = f"xhs-upload-u{current_user.id}-"
-    if Path(file_name).name != file_name or ".." in file_name or not file_name.startswith(prefix):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
+    # 复用统一归属校验：覆盖 xhs-image-/xhs-asset-/xhs-upload- 三个前缀。
+    # 此前只允许 xhs-upload-，下载器生成的 xhs-asset- 素材用户自己都删不掉，
+    # media 目录只增不减。
+    _validate_owner_media_name(file_name, current_user)
+    if file_name.startswith(f"xhs-clip-u{current_user.id}-"):
+        # 成片是剪辑工坊的受管资产（可能已关联草稿，删除有业务约束），
+        # 必须走 DELETE /api/clip/exports/{id}，不能绕过业务校验直接删文件
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="成片请通过剪辑工坊删除")
     file_path = _media_dir() / file_name
     if not file_path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Image not found")
@@ -171,7 +210,7 @@ def _media_viewer_user(
             payload = None
         if payload and payload.get("token_type") == "access":
             user = db.get(User, payload["user_id"])
-            if user is not None:
+            if user is not None and int(payload.get("ver") or 0) == int(user.token_version or 0):
                 return user
     if media_token:
         try:
@@ -180,20 +219,33 @@ def _media_viewer_user(
             payload = None
         if payload and payload.get("token_type") == "media":
             user = db.get(User, payload["user_id"])
-            if user is not None:
+            # review P2：令牌版本校验，吊销后 media cookie 立即失效
+            if user is not None and int(payload.get("ver") or 0) == int(user.token_version or 0):
                 return user
     raise credentials_error
 
 
 @router.get("/media/{file_name}")
-def download_media(file_name: str, viewer: User = Depends(_media_viewer_user)):
+def download_media(
+    file_name: str,
+    viewer: User = Depends(_media_viewer_user),
+    db: Session = Depends(get_db),
+):
     if Path(file_name).name != file_name or ".." in file_name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
+    # 应用权限：clip 成片是剪辑工坊受管资产，回收后已获知的 download_url
+    # 也不得继续下载（review 第 1 轮 P2）
+    if file_name.startswith(f"xhs-clip-u{viewer.id}-"):
+        from backend.app.services.app_perms import user_has_access
+
+        if not user_has_access(db, viewer, "clip"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="该应用未对当前账号开通")
     # 属主校验：媒体文件名统一携带 xhs-*-u{user_id}- 前缀
     owner_prefixes = (
         f"xhs-image-u{viewer.id}-",
         f"xhs-asset-u{viewer.id}-",
         f"xhs-upload-u{viewer.id}-",
+        f"xhs-clip-u{viewer.id}-",
     )
     if not file_name.startswith(owner_prefixes):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Media file not found")
@@ -225,34 +277,63 @@ MAX_UPLOAD_SIZE = 100 * 1024 * 1024
 
 
 @router.post("/upload")
-async def upload_file(file: UploadFile, current_user: User = Depends(get_current_user)):
+async def upload_file(
+    file: UploadFile,
+    current_user: User = Depends(get_current_user),
+    content_length: Optional[int] = Header(default=None),
+):
     if not file.filename:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件名不能为空")
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_UPLOAD_EXTENSIONS:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"不支持的文件格式: {ext}")
 
-    # 分块读取，超限即中止，避免恶意大文件先整读进内存
-    content = bytearray()
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        content.extend(chunk)
-        if len(content) > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="文件大小超过 100MB 限制")
+    # 预检声明大小（SEC-4）：超限直接 413，不进入分块读取
+    declared_size = getattr(file, "size", None) or content_length
+    if declared_size is not None and declared_size > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="文件大小超过 100MB 限制")
 
+    # 流式写盘（SEC-4）：数据落临时文件，内存占用恒定；超限立即中止并清理
     asset_type = "video" if ext in {".mp4", ".mov", ".avi", ".mkv"} else "image"
     file_name = f"xhs-upload-u{current_user.id}-{uuid4().hex}{ext}"
     media_dir = _media_dir()
     media_dir.mkdir(parents=True, exist_ok=True)
     output_path = media_dir / file_name
-    output_path.write_bytes(content)
+    total = 0
+    try:
+        # async 端点里的同步磁盘 IO 会占用事件循环线程（其他端点都跑在线程池），
+        # 慢盘/网络盘上会阻塞整个服务。open/write/close 全部走 anyio 工作线程。
+        import anyio
+
+        out = await anyio.open_file(output_path, "wb")
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="文件大小超过 100MB 限制",
+                    )
+                await out.write(chunk)
+        finally:
+            await out.aclose()
+    except HTTPException:
+        output_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+
+    if total == 0:
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="上传文件为空")
 
     return {
         "file_name": file_name,
-        "file_path": str(output_path.resolve()),
         "download_url": f"/api/files/media/{file_name}",
         "asset_type": asset_type,
-        "size": len(content),
+        "size": total,
     }

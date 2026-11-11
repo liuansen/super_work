@@ -1,0 +1,70 @@
+{
+  "reviewed_repo": "opencut-app/opencut-classic",
+  "pinned_commit": "cf5e79e919144200294fb9fed22a222592a0aeea",
+  "review_date": "2026-11-12",
+  "verification_level": "source-level",
+  "capabilities": [
+    {
+      "id": "multi_clip_timeline",
+      "name": "多段视频/图片拼接",
+      "result": "pass-source",
+      "evidence": [
+        "apps/web/src/components/editor/scenes-view.tsx",
+        "apps/web/src/timeline/",
+        "apps/web/src/commands/timeline/element/insert-element.ts"
+      ],
+      "screenshots": []
+    },
+    {
+      "id": "trim",
+      "name": "裁剪首尾",
+      "result": "pass-source",
+      "evidence": [
+        "apps/web/src/commands/timeline/element/split-elements.ts",
+        "apps/web/src/panels/properties（trim 控制）"
+      ],
+      "screenshots": []
+    },
+    {
+      "id": "background_music",
+      "name": "背景音乐",
+      "result": "pass-source",
+      "evidence": [
+        "apps/web/src/components/editor/panels/assets（audio 资产）",
+        "apps/web/src/services/waveform-cache",
+        "apps/web/src/export/index.ts includeAudio"
+      ],
+      "screenshots": []
+    },
+    {
+      "id": "text_subtitles",
+      "name": "字幕/标题",
+      "result": "pass-source",
+      "evidence": [
+        "apps/web/src/subtitles/parse.ts",
+        "apps/web/src/subtitles/insert.ts",
+        "apps/web/src/services/transcription"
+      ],
+      "screenshots": []
+    },
+    {
+      "id": "cover_frame",
+      "name": "封面帧",
+      "result": "pass-source",
+      "evidence": ["apps/web/src/commands（thumbnail 相关）", "导出选项与首帧渲染能力（renderer）"],
+      "screenshots": []
+    },
+    {
+      "id": "export_mp4",
+      "name": "导出 MP4",
+      "result": "pass-source",
+      "evidence": [
+        "apps/web/src/export/index.ts（mp4/webm + 4 档质量）",
+        "apps/web/src/services/renderer/（wasm-compositor + gpu-renderer）"
+      ],
+      "screenshots": []
+    }
+  ],
+  "runtime_manual_verification": "pending",
+  "notes": "工作台侧集成（Plan A）使用契约 stub，不依赖本报告的运行时验证；Plan B（fork 补丁）开工前必须完成 runtime_manual_verification。"
+}

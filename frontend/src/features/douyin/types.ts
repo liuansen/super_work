@@ -65,7 +65,6 @@ export interface DouyinPublishTask {
 
 export interface MediaUploadResult {
   file_name: string;
-  file_path: string;
   download_url: string;
   asset_type: "video" | "image";
   size: number;

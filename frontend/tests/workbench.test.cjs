@@ -13,7 +13,7 @@ delete globalThis.MessageChannel;
 
 test('registry exposes the real XHS and douyin apps and never falls back for unknown IDs', () => {
   const { workbenchApps, findWorkbenchApp } = load('src/apps/registry.ts');
-  assert.equal(workbenchApps.length, 2);
+  assert.equal(workbenchApps.length, 3);
   assert.deepEqual(workbenchApps[0], {
     id: 'xhs', name: '小红书运营', description: '采集、内容管理、创作与发布的一站式运营工作台',
     icon: '/logo.jpg', entryPath: '/platforms/xhs/dashboard', enabled: true
@@ -44,7 +44,13 @@ test('center shows the real app, username, logout, and navigates on selection', 
   let logouts = 0;
   const auth = authStub({ logout: async () => { logouts += 1; } });
   const { AppCenterPage } = load('src/pages/apps/app-center-page.tsx', {
-    [authPath]: { useAuth: () => auth }
+    [authPath]: { useAuth: () => auth },
+    'src/hooks/use-apps.ts': {
+      useMyApps: () => ({
+        apps: [], isLoading: false, isError: false,
+        has: () => true, refresh: async () => {}
+      })
+    }
   });
   const view = await render(h(MemoryRouter, { initialEntries: ['/apps'] },
     h(Routes, null,
@@ -55,7 +61,7 @@ test('center shows the real app, username, logout, and navigates on selection', 
   try {
     assert.match(view.container.textContent, /超级工作台/);
     assert.match(view.container.textContent, /测试用户/);
-    assert.equal(view.container.querySelectorAll('[data-app-id]').length, 2);
+    assert.equal(view.container.querySelectorAll('[data-app-id]').length, 3);
     const logout = [...view.container.querySelectorAll('button')].find(x => x.textContent.includes('退出登录'));
     await view.click(logout);
     assert.equal(logouts, 1);
@@ -78,6 +84,13 @@ test('center shows the real app, username, logout, and navigates on selection', 
 test('disabled apps cannot be selected and names remain text', async () => {
   const { AppCenterPage } = load('src/pages/apps/app-center-page.tsx', {
     [authPath]: { useAuth: () => authStub() },
+    'src/hooks/use-apps.ts': {
+      // enabled 现以服务端目录为准（registry 静态值仅兜底）
+      useMyApps: () => ({
+        apps: [{ app_key: 'disabled', name: '', description: '', enabled: false, sort_order: 0, accessible: true }],
+        isLoading: false, isError: false, has: () => true, refresh: async () => {}
+      })
+    },
     [registryPath]: { workbenchApps: [{ id: 'disabled', name: '<b>不可执行</b>', description: '未开放', icon: '/logo.jpg', entryPath: '/unused', enabled: false }] }
   });
   const view = await render(h(MemoryRouter, null, h(AppCenterPage)));
@@ -116,6 +129,13 @@ for (const scenario of ['enabled', 'unknown', 'disabled']) {
 function routeMocks(auth) {
   const stubs = {
     [authPath]: { useAuth: () => auth },
+    // 应用权限：路由守卫 RequireApp 消费；默认全量可见 + 管理员
+    'src/hooks/use-apps.ts': {
+      useMyApps: () => ({
+        apps: [], isLoading: false, isError: false,
+        has: () => true, refresh: async () => {}
+      })
+    },
     'src/components/layout/app-shell.tsx': { AppShell: frontRequire('react-router-dom').Outlet }
   };
   const pages = {
@@ -221,6 +241,9 @@ for (const mode of ['login', 'register']) {
 test('shell exposes an app-center button in both expanded and collapsed states', async () => {
   const { AppShell } = load('src/components/layout/app-shell.tsx', {
     [authPath]: { useAuth: () => authStub() },
+    'src/hooks/use-apps.ts': {
+      useMyApps: () => ({ apps: [], isLoading: false, isError: false, has: () => true, refresh: async () => {} })
+    },
     'src/lib/api.ts': { fetchNotifications: async () => ({ items: [] }), markAllNotificationsRead: async () => {}, markNotificationRead: async () => {} },
     'src/app/providers.tsx': { useThemeMode: () => ({ mode: 'dark', toggle() {} }) }
   });

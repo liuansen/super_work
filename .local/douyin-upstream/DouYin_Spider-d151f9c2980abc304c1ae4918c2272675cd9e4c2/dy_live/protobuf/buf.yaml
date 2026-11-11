@@ -1,4 +1,0 @@
-# https://buf.build/docs/configuration/v2/buf-yaml/
-version: v2
-modules:
-  - path: proto

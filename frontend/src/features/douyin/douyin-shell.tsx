@@ -7,6 +7,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   MoonOutlined,
+  ScissorOutlined,
   SendOutlined,
   SunOutlined,
   SafetyCertificateOutlined,
@@ -18,20 +19,28 @@ import { useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 
 import { useThemeMode } from "../../app/providers";
+import { useMyApps } from "../../hooks/use-apps";
 import { useAuth } from "../../hooks/use-auth";
 
 const { Sider, Header, Content } = Layout;
 const { Text } = Typography;
 
-const mainNavItems: MenuProps["items"] = [
-  { key: "/platforms/douyin/accounts", icon: <SafetyCertificateOutlined />, label: "账号" },
-  { key: "/platforms/douyin/references", icon: <DatabaseOutlined />, label: "参考库" },
-  { key: "/platforms/douyin/works", icon: <FundOutlined />, label: "作品数据" },
-  { key: "/platforms/douyin/publish", icon: <SendOutlined />, label: "发布中心" },
-];
+function buildDouyinNav(douyinAllowed: boolean, clipAllowed: boolean): MenuProps["items"] {
+  if (!douyinAllowed) return [];
+  return [
+    { key: "/platforms/douyin/accounts", icon: <SafetyCertificateOutlined />, label: "账号" },
+    { key: "/platforms/douyin/references", icon: <DatabaseOutlined />, label: "参考库" },
+    { key: "/platforms/douyin/works", icon: <FundOutlined />, label: "作品数据" },
+    ...(clipAllowed ? [{ key: "/clip", icon: <ScissorOutlined />, label: "剪辑工坊" as const }] : []),
+    { key: "/platforms/douyin/publish", icon: <SendOutlined />, label: "发布中心" },
+  ];
+}
 
 export function DouyinShell() {
   const auth = useAuth();
+  const myApps = useMyApps();
+  const douyinAllowed = myApps.has("douyin");
+  const clipAllowed = myApps.has("clip");
   const { mode: themeMode, toggle: toggleTheme } = useThemeMode();
   const navigate = useNavigate();
   const location = useLocation();
@@ -53,7 +62,7 @@ export function DouyinShell() {
           left: 0,
           top: 0,
           bottom: 0,
-          borderRight: "1px solid #303030",
+          borderRight: "1px solid var(--app-border)",
           overflow: "hidden",
         }}
       >
@@ -64,7 +73,7 @@ export function DouyinShell() {
               display: "flex",
               alignItems: "center",
               justifyContent: collapsed ? "center" : "space-between",
-              borderBottom: "1px solid #303030",
+              borderBottom: "1px solid var(--app-border)",
               flexShrink: 0,
               cursor: "pointer",
             }}
@@ -92,19 +101,19 @@ export function DouyinShell() {
                   e.stopPropagation();
                   setCollapsed(true);
                 }}
-                style={{ color: "rgba(255,255,255,.35)" }}
+                style={{ color: "var(--app-text-disabled)" }}
               />
             )}
           </div>
           {collapsed && (
-            <div style={{ textAlign: "center", padding: "6px 0", borderBottom: "1px solid #262626", flexShrink: 0 }}>
+            <div style={{ textAlign: "center", padding: "6px 0", borderBottom: "1px solid var(--app-elevated)", flexShrink: 0 }}>
               <Button
                 type="text"
                 size="small"
                 aria-label="展开侧栏"
                 icon={<MenuUnfoldOutlined />}
                 onClick={() => setCollapsed(false)}
-                style={{ color: "rgba(255,255,255,.35)" }}
+                style={{ color: "var(--app-text-disabled)" }}
               />
             </div>
           )}
@@ -116,7 +125,7 @@ export function DouyinShell() {
               aria-label="应用中心"
               title="应用中心"
               onClick={() => navigate("/apps")}
-              style={{ color: "rgba(255,255,255,.65)" }}
+              style={{ color: "var(--app-text-secondary)" }}
             >
               {!collapsed && "应用中心"}
             </Button>
@@ -128,12 +137,12 @@ export function DouyinShell() {
               mode="inline"
               selectedKeys={selectedKeys}
               onClick={({ key }) => navigate(key)}
-              items={mainNavItems}
+              items={buildDouyinNav(douyinAllowed, clipAllowed)}
               style={{ borderRight: 0 }}
             />
           </div>
 
-          <div style={{ flexShrink: 0, borderTop: "1px solid #303030" }}>
+          <div style={{ flexShrink: 0, borderTop: "1px solid var(--app-border)" }}>
             <div
               style={{
                 padding: collapsed ? "8px 0" : "8px 16px",
@@ -156,7 +165,7 @@ export function DouyinShell() {
                     icon={<LogoutOutlined />}
                     onClick={() => void auth.logout()}
                     size="small"
-                    style={{ color: "rgba(255,255,255,0.35)", flexShrink: 0 }}
+                    style={{ color: "var(--app-text-disabled)", flexShrink: 0 }}
                   />
                 </>
               )}
@@ -172,7 +181,7 @@ export function DouyinShell() {
             display: "flex",
             alignItems: "center",
             justifyContent: "flex-end",
-            borderBottom: "1px solid #303030",
+            borderBottom: "1px solid var(--app-border)",
             height: 48,
             lineHeight: "48px",
           }}

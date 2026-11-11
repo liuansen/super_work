@@ -43,7 +43,7 @@ import {
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import {
@@ -61,6 +61,7 @@ import {
   fetchTags,
 } from "../../../lib/api";
 import { formatShanghaiTime } from "../../../lib/time";
+import { useLatestRequest } from "../../../hooks/use-latest-request";
 import type { NoteAsset, NoteComment, NotesExportResponse, SavedNote, Tag as TagType } from "../../../types";
 
 const { Title, Text, Paragraph } = Typography;
@@ -202,24 +203,33 @@ export function XhsLibraryPage() {
   const [selectedPreviewAsset, setSelectedPreviewAsset] = useState<NoteAsset | null>(null);
 
   const selectedNoteIdSet = new Set(selectedNoteIds);
+  const request = useLatestRequest();
 
   async function loadNotes(
     overrideFilters?: { q?: string; tag_id?: number; has_assets?: boolean; has_comments?: boolean },
     targetPage?: number,
     targetPageSize?: number
   ) {
+    const seq = request.begin();
     setIsLoading(true); setError(null);
     const f = overrideFilters ?? { q: keywordFilter.trim() || undefined, tag_id: selectedTagFilter ? Number(selectedTagFilter) : undefined, has_assets: hasAssetsFilter || undefined, has_comments: hasCommentsFilter || undefined };
     const nextPage = targetPage ?? page;
     const nextPageSize = targetPageSize ?? pageSize;
     try {
       const r = await fetchSavedNotes({ platform: "xhs", ...f, page: nextPage, page_size: nextPageSize });
+      // review P1：快速连点筛选/翻页时，旧响应不得覆盖新结果
+      if (!request.isLatest(seq)) return;
       setNotes(r.items); setTotal(r.total);
       setPage(nextPage);
       setPageSize(nextPageSize);
       const ids = new Set(r.items.map((n) => n.id));
       setSelectedNoteIds((c) => c.filter((id) => ids.has(id)));
-    } catch { setError("内容库加载失败。"); } finally { setIsLoading(false); }
+    } catch {
+      if (!request.isLatest(seq)) return;
+      setError("内容库加载失败。");
+    } finally {
+      if (request.isLatest(seq)) setIsLoading(false);
+    }
   }
 
   useEffect(() => { void loadNotes(); void loadTags(); }, []);
@@ -231,10 +241,21 @@ export function XhsLibraryPage() {
 
   async function loadTags() { try { const r = await fetchTags(); setAvailableTags(r.items); } catch { setAvailableTags([]); } }
 
+  // FE-9：请求序号——只有最新一次 openDetail 的响应才允许写入状态
+  const detailRequestRef = useRef(0);
+
   async function openDetail(note: SavedNote) {
+    const requestId = ++detailRequestRef.current;
     setIsDetailOpen(true); setSelectedNote(note); setDetailError(null); setDetailActionMessage(null); setTagActionMessage(null); resetComments(); setIsDetailLoading(true);
-    try { const [d, a] = await Promise.all([fetchSavedNote(note.id), fetchSavedNoteAssets(note.id)]); setSelectedNote(d); setSelectedAssets(a.items); }
-    catch { setDetailError("笔记详情加载失败。"); } finally { setIsDetailLoading(false); }
+    try {
+      const [d, a] = await Promise.all([fetchSavedNote(note.id), fetchSavedNoteAssets(note.id)]);
+      if (requestId !== detailRequestRef.current) return; // 已被更新的选择覆盖
+      setSelectedNote(d); setSelectedAssets(a.items);
+    } catch {
+      if (requestId === detailRequestRef.current) setDetailError("笔记详情加载失败。");
+    } finally {
+      if (requestId === detailRequestRef.current) setIsDetailLoading(false);
+    }
   }
   function closeDetail() { setIsDetailOpen(false); setDetailError(null); setDetailActionMessage(null); setTagActionMessage(null); setSelectedAssets([]); resetComments(); }
   function resetComments() { setIsCommentsOpen(false); setComments([]); setCommentsTotal(0); setCommentsPage(1); setIsCommentsLoading(false); setCommentsError(null); }
@@ -309,16 +330,21 @@ export function XhsLibraryPage() {
   async function batchDeleteNotes() {
     if (!selectedNoteIds.length) return;
     setIsBatchWorking(true); setBatchActionMessage(null);
-    try {
-      for (const id of selectedNoteIds) {
-        await deleteSavedNote(id);
-      }
-      setNotes((c) => c.filter((n) => !selectedNoteIds.includes(n.id)));
-      setTotal((c) => Math.max(0, c - selectedNoteIds.length));
-      setBatchActionMessage(`已删除 ${selectedNoteIds.length} 条笔记。`);
-      setSelectedNoteIds([]);
-    } catch { setBatchActionMessage("批量删除失败。"); }
-    finally { setIsBatchWorking(false); }
+    // FE-16：allSettled 并发删除，部分失败时已成功项照样更新列表与 total，失败项提示重试
+    const results = await Promise.allSettled(selectedNoteIds.map((id) => deleteSavedNote(id)));
+    const failedIds = selectedNoteIds.filter((_, i) => results[i].status === "rejected");
+    const deletedIds = selectedNoteIds.filter((id) => !failedIds.includes(id));
+    if (deletedIds.length) {
+      setNotes((c) => c.filter((n) => !deletedIds.includes(n.id)));
+      setTotal((c) => Math.max(0, c - deletedIds.length));
+    }
+    setSelectedNoteIds(failedIds);
+    if (failedIds.length === 0) {
+      setBatchActionMessage(`已删除 ${deletedIds.length} 条笔记。`);
+    } else {
+      setBatchActionMessage(`已删除 ${deletedIds.length} 条，${failedIds.length} 条失败（已保留勾选，可重试）。`);
+    }
+    setIsBatchWorking(false);
   }
 
   async function downloadLatestExport() {
@@ -432,9 +458,9 @@ export function XhsLibraryPage() {
               <Col xs={12} sm={8} md={6} lg={4} xl={4} key={note.id}>
                 <Card hoverable size="small" style={{ overflow: "hidden" }} onClick={() => void openDetail(note)}
                   cover={
-                    <div style={{ position: "relative", background: "#262626" }}>
+                    <div style={{ position: "relative", background: "var(--app-elevated)" }}>
                       <Checkbox checked={selectedNoteIdSet.has(note.id)} onClick={(e) => { e.stopPropagation(); toggleNoteSelection(note.id); }} style={{ position: "absolute", top: 8, left: 8, zIndex: 2 }} />
-                      {cover ? <img src={cover} alt={note.title} referrerPolicy="no-referrer" style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", display: "block" }} /> : <div style={{ width: "100%", aspectRatio: "1/1", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,.2)", fontSize: 28 }}><PictureOutlined /></div>}
+                      {cover ? <img src={cover} alt={note.title} referrerPolicy="no-referrer" style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", display: "block" }} /> : <div style={{ width: "100%", aspectRatio: "1/1", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--app-text-disabled)", fontSize: 28 }}><PictureOutlined /></div>}
                       <Tag color={kind.includes("video") ? "purple" : "blue"} style={{ position: "absolute", top: 8, right: 8 }} icon={kind.includes("video") ? <PlayCircleOutlined /> : <PictureOutlined />}>{kind.includes("video") ? "视频" : "图文"}</Tag>
                     </div>
                   }>
@@ -448,7 +474,7 @@ export function XhsLibraryPage() {
                         const eng = getNoteEngagement(note);
                         if (!eng.likes && !eng.collects && !eng.comments && !eng.shares) return null;
                         return (
-                          <div style={{ marginTop: 4, display: "flex", gap: 8, fontSize: 11, color: "rgba(255,255,255,.45)" }}>
+                          <div style={{ marginTop: 4, display: "flex", gap: 8, fontSize: 11, color: "var(--app-text-tertiary-weak)" }}>
                             {eng.likes > 0 && <span><HeartOutlined /> {eng.likes}</span>}
                             {eng.collects > 0 && <span><StarOutlined /> {eng.collects}</span>}
                             {eng.comments > 0 && <span><MessageOutlined /> {eng.comments}</span>}
@@ -480,7 +506,7 @@ export function XhsLibraryPage() {
         </div>
       )}
 
-      <Drawer title={selectedNote?.title || "笔记详情"} open={isDetailOpen} onClose={closeDetail} width={640} styles={{ body: { background: "#1a1a1a" } }}>
+      <Drawer title={selectedNote?.title || "笔记详情"} open={isDetailOpen} onClose={closeDetail} width={640} styles={{ body: { background: "var(--app-panel-bg)" } }}>
         {selectedNote && (
           <Spin spinning={isDetailLoading}>
             {detailError && <Alert message={detailError} type="warning" showIcon style={{ marginBottom: 12 }} />}
@@ -515,7 +541,7 @@ export function XhsLibraryPage() {
                   <Space size={8} wrap>
                     {selectedAssets.map((a) => (
                       a.asset_type === "video" ? (
-                        <div key={a.id} style={{ width: 80, height: 80, background: "#262626", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                        <div key={a.id} style={{ width: 80, height: 80, background: "var(--app-elevated)", borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center" }}>
                           <Button type="link" icon={<PlayCircleOutlined />} href={a.url} target="_blank" rel="noreferrer">视频</Button>
                         </div>
                       ) : <Image key={a.id} src={a.url} width={80} height={80} style={{ objectFit: "cover", borderRadius: 6 }} referrerPolicy="no-referrer" />
@@ -527,23 +553,23 @@ export function XhsLibraryPage() {
 
             <div style={{ marginBottom: 16 }}>
               <Text strong>正文</Text>
-              <Paragraph style={{ marginTop: 4, color: "rgba(255,255,255,.65)", whiteSpace: "pre-wrap" }}>{selectedNote.content || "暂无正文。"}</Paragraph>
+              <Paragraph style={{ marginTop: 4, color: "var(--app-text-secondary)", whiteSpace: "pre-wrap" }}>{selectedNote.content || "暂无正文。"}</Paragraph>
             </div>
 
             <Button onClick={toggleComments} style={{ marginBottom: 8 }}>{isCommentsOpen ? "收起评论" : `查看评论 (${commentsTotal})`}</Button>
             {isCommentsOpen && (
-              <Card size="small" style={{ background: "#1f1f1f" }}>
+              <Card size="small" style={{ background: "var(--app-surface-alt)" }}>
                 {commentsError && <Alert message={commentsError} type="error" showIcon style={{ marginBottom: 8 }} />}
                 {isCommentsLoading && <Spin size="small" />}
                 {topLevelComments.length === 0 && !isCommentsLoading ? <Text type="secondary">暂无评论</Text> : null}
                 {topLevelComments.map((c) => (
-                  <div key={c.comment_id} style={{ marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid #303030" }}>
+                  <div key={c.comment_id} style={{ marginBottom: 10, paddingBottom: 8, borderBottom: "1px solid var(--app-border)" }}>
                     <Space><Text strong style={{ fontSize: 13 }}>{c.user_name}</Text><Text type="secondary" style={{ fontSize: 11 }}>{c.created_at_remote} · {c.like_count} likes</Text></Space>
-                    <div style={{ color: "rgba(255,255,255,.65)", fontSize: 13, marginTop: 2 }}>{c.content}</div>
+                    <div style={{ color: "var(--app-text-secondary)", fontSize: 13, marginTop: 2 }}>{c.content}</div>
                     {childComments(c.comment_id).map((r) => (
-                      <div key={r.comment_id} style={{ marginLeft: 20, marginTop: 4, paddingLeft: 8, borderLeft: "2px solid #303030" }}>
+                      <div key={r.comment_id} style={{ marginLeft: 20, marginTop: 4, paddingLeft: 8, borderLeft: "2px solid var(--app-border)" }}>
                         <Space><Text strong style={{ fontSize: 12 }}>{r.user_name}</Text><Text type="secondary" style={{ fontSize: 11 }}>{r.like_count} likes</Text></Space>
-                        <div style={{ color: "rgba(255,255,255,.55)", fontSize: 12 }}>{r.content}</div>
+                        <div style={{ color: "var(--app-text-secondary)", fontSize: 12 }}>{r.content}</div>
                       </div>
                     ))}
                   </div>
@@ -554,8 +580,8 @@ export function XhsLibraryPage() {
 
             {selectedNote.raw_json && (
               <details style={{ marginTop: 16 }}>
-                <summary style={{ cursor: "pointer", color: "rgba(255,255,255,.45)", fontSize: 12 }}>原始 JSON</summary>
-                <pre style={{ fontSize: 11, color: "rgba(255,255,255,.5)", background: "#1f1f1f", padding: 8, borderRadius: 6, overflow: "auto", maxHeight: 300 }}>{JSON.stringify(selectedNote.raw_json, null, 2)}</pre>
+                <summary style={{ cursor: "pointer", color: "var(--app-text-tertiary-weak)", fontSize: 12 }}>原始 JSON</summary>
+                <pre style={{ fontSize: 11, color: "var(--app-text-tertiary)", background: "var(--app-surface-alt)", padding: 8, borderRadius: 6, overflow: "auto", maxHeight: 300 }}>{JSON.stringify(selectedNote.raw_json, null, 2)}</pre>
               </details>
             )}
           </Spin>

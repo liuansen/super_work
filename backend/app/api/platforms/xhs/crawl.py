@@ -16,16 +16,26 @@ logger = logging.getLogger(__name__)
 from backend.app.api.platforms.xhs.pc import (
     _get_owned_pc_account_cookies,
     _normalize_detail_payload,
-    _normalize_search_item,
     normalize_comment_payload,
     get_xhs_pc_api_adapter_factory,
 )
+from backend.app.services.note_ingest import (
+    save_normalized_notes as _save_normalized_notes,
+)
+from backend.app.services.xhs_normalizers import (
+    data_items as _data_items,
+    normalize_search_item as _normalize_search_item,
+)
 from backend.app.api.tasks import serialize_task
 from backend.app.core.database import get_db
-from backend.app.core.deps import get_current_user
+from backend.app.core.deps import app_access_required, get_current_user
 from backend.app.models import Note, NoteAsset, PlatformAccount, Task, User
 
-router = APIRouter(prefix="/xhs/crawl", tags=["xhs-crawl"])
+router = APIRouter(
+    prefix="/xhs/crawl",
+    tags=["xhs-crawl"],
+    dependencies=[Depends(app_access_required("xhs"))],
+)
 
 
 class CrawlSearchNotesRequest(BaseModel):
@@ -59,6 +69,8 @@ class DataCrawlRequest(BaseModel):
     # 默认 2s 间隔：默认不限流直打平台接口有账号风控风险
     time_sleep: float = Field(default=2, ge=0, le=60)
     fetch_comments: bool = False
+    # BE-6/W0-3：抓取数据默认只读流式返回；显式传入 true 才入库内容库
+    save_to_library: bool = False
     sort_type_choice: int = Field(default=0, ge=0, le=4)
     note_type: int = Field(default=0, ge=0, le=2)
     note_time: int = Field(default=0, ge=0, le=3)
@@ -117,79 +129,7 @@ def _fail_task(db: Session, task: Task, error: str) -> None:
     db.commit()
 
 
-def _data_items(raw_payload: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_payload, dict):
-        return []
-    data = raw_payload.get("data") if isinstance(raw_payload.get("data"), dict) else raw_payload
-    items = data.get("items") or data.get("notes") or data.get("list") or []
-    return [item for item in items if isinstance(item, dict) and item.get("model_type") not in ("rec_query", "hot_query")]
-
-
-def _raw_with_metrics(normalized: dict[str, Any]) -> dict[str, Any]:
-    raw = normalized.get("raw") if isinstance(normalized.get("raw"), dict) else {}
-    return {
-        **raw,
-        "note_url": normalized.get("note_url", ""),
-        "tags": normalized.get("tags", []),
-        "likes": normalized.get("likes", 0),
-        "collects": normalized.get("collects", 0),
-        "comments": normalized.get("comments", 0),
-        "shares": normalized.get("shares", 0),
-    }
-
-
-def _image_urls(normalized: dict[str, Any]) -> list[str]:
-    urls = normalized.get("image_urls")
-    if isinstance(urls, list) and urls:
-        return [str(url) for url in urls if url]
-    cover_url = normalized.get("cover_url")
-    return [str(cover_url)] if cover_url else []
-
-
-def _video_url(normalized: dict[str, Any]) -> str:
-    return str(normalized.get("video_url") or normalized.get("video_addr") or "")
-
-
-def _save_normalized_notes(
-    db: Session,
-    account: PlatformAccount,
-    normalized_items: list[dict[str, Any]],
-) -> list[Note]:
-    saved: list[Note] = []
-    for normalized in normalized_items:
-        note_id = str(normalized.get("note_id") or "").strip()
-        if not note_id:
-            continue
-        note = db.scalars(
-            select(Note).where(Note.user_id == account.user_id, Note.note_id == note_id)
-        ).first()
-        if note is None:
-            note = Note(user_id=account.user_id, platform_account_id=account.id, platform=account.platform, note_id=note_id)
-            db.add(note)
-        note.title = str(normalized.get("title") or "")
-        note.content = str(normalized.get("content") or "")
-        note.author_name = str(normalized.get("author_name") or "")
-        note.raw_json = _raw_with_metrics(normalized)
-        db.flush()
-        db.execute(delete(NoteAsset).where(NoteAsset.note_id == note.id))
-        for url in _image_urls(normalized):
-            local_name = _download_asset(url, account.user_id, "image")
-            db.add(NoteAsset(note_id=note.id, asset_type="image", url=url, local_path=local_name or ""))
-        video_url = _video_url(normalized)
-        if video_url:
-            local_name = _download_asset(video_url, account.user_id, "video")
-            db.add(NoteAsset(note_id=note.id, asset_type="video", url=video_url, local_path=local_name or ""))
-        saved.append(note)
-
-    db.commit()
-    for note in saved:
-        db.refresh(note)
-    return saved
-
-
-def _download_asset(url: str, user_id: int, asset_type: str) -> str | None:
-    from backend.app.services.asset_downloader import download_asset_to_local
-    return download_asset_to_local(url, user_id, asset_type)
+CRAWL_MAX_DURATION_SECONDS = 15 * 60
 
 
 def _sleep_between_requests(seconds: float) -> None:
@@ -368,14 +308,21 @@ def crawl_data(
     task_id = task.id
     adapter = adapter_factory(cookies)
 
+    crawl_deadline = time.monotonic() + CRAWL_MAX_DURATION_SECONDS
+
     def generate() -> Generator[str, None, None]:
         items: list[dict[str, Any]] = []
         normalized_for_save: list[dict[str, Any]] = []
         error_occurred = False
+        budget_exceeded = False
 
         try:
             if payload.mode == "note_urls":
                 for index, url in enumerate(payload.urls):
+                    if time.monotonic() > crawl_deadline:
+                        budget_exceeded = True
+                        yield _sse_event({"type": "error", "message": "抓取时长达到预算上限（15 分钟），已截断"})
+                        break
                     success, message, raw_payload = adapter.get_note_info(url)
                     if success:
                         note = _normalize_detail_payload(raw_payload or {})
@@ -402,6 +349,10 @@ def crawl_data(
 
             elif payload.mode == "comments":
                 for index, url in enumerate(payload.urls):
+                    if time.monotonic() > crawl_deadline:
+                        budget_exceeded = True
+                        yield _sse_event({"type": "error", "message": "抓取时长达到预算上限（15 分钟），已截断"})
+                        break
                     success, message, raw_payload = adapter.get_note_comments(url)
                     if success:
                         item = _crawl_data_item(source=url, status="success", comments=normalize_comment_payload(raw_payload))
@@ -418,6 +369,10 @@ def crawl_data(
                     return
                 seen_urls: list[str] = []
                 for page in range(1, payload.pages + 1):
+                    if time.monotonic() > crawl_deadline:
+                        budget_exceeded = True
+                        yield _sse_event({"type": "error", "message": "抓取时长达到预算上限（15 分钟），已截断"})
+                        break
                     success, message, raw_payload = adapter.search_note(
                         payload.keyword, page=page,
                         sort_type_choice=payload.sort_type_choice,
@@ -484,11 +439,23 @@ def crawl_data(
             # 任务收尾必须放 finally，否则 Task 永久停留在 running
             success_count = len([i for i in items if i["status"] == "success"])
             failed_count = len(items) - success_count
+            saved_count = 0
+            # review P1-3：入库与任务终结拆成独立 try——入库失败不得吞掉终结，
+            # 否则 Task 永久 running 且 audit-only 类型无法 cancel/retry
             try:
-                if error_occurred:
+                # BE-6：显式开关才入库；入库放在流结束前的 finally，客户端中断也尽量落库
+                if payload.save_to_library and normalized_for_save:
+                    saved_notes = _save_normalized_notes(db, account, normalized_for_save)
+                    saved_count = len(saved_notes)
+            except Exception as save_exc:
+                logger.warning(f"Crawl task {getattr(task, 'id', '?')} save failed: {save_exc}")
+            try:
+                if budget_exceeded and not error_occurred:
+                    _fail_task(db, task, f"crawl budget exceeded after {len(items)} items")
+                elif error_occurred:
                     _fail_task(db, task, "partial failure")
                 else:
-                    _complete_task(db, task, {"result_count": success_count, "failed_count": failed_count})
+                    _complete_task(db, task, {"result_count": success_count, "failed_count": failed_count, "saved_count": saved_count})
             except Exception as fin_exc:
                 logger.warning(f"Crawl task {getattr(task, 'id', '?')} finalization failed: {fin_exc}")
 

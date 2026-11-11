@@ -49,16 +49,26 @@ def get_owned_reference(
 
 
 def list_references(
-    db: Session, user_id: int, keyword: str = "", tag: str = ""
+    db: Session, user_id: int, keyword: str = "", tag: str = "", limit: int = 200
 ) -> list[DouyinReferenceWork]:
     stmt = (
         select(DouyinReferenceWork)
         .where(DouyinReferenceWork.user_id == user_id)
         .order_by(DouyinReferenceWork.id.desc())
     )
-    rows = list(db.scalars(stmt))
+    # review 复核 P2：过滤必须发生在 limit 之前——先截断再过滤会让
+    # 「只命中被截断掉的旧记录」的关键词永远搜不到（语义上是搜不到而非不存在）。
+    # keyword 下推 SQL LIKE；tag 是受控 JSON 数组（元素为不含转义引号的
+    # 纯文本标签），用 `"tag"` 子串匹配等价于元素相等。
     if keyword:
-        rows = [r for r in rows if keyword.lower() in (r.title or "").lower()]
+        # LIKE 通配符转义，保持与原「子串包含」语义一致
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        stmt = stmt.where(DouyinReferenceWork.title.ilike(f"%{escaped}%", escape="\\"))
+    if tag:
+        stmt = stmt.where(DouyinReferenceWork.tags_json.contains(json.dumps(tag, ensure_ascii=False)))
+    stmt = stmt.limit(limit)
+    rows = list(db.scalars(stmt))
+    # tag 的 LIKE 匹配是超集（子串撞名），Python 精筛保证最终结果准确
     if tag:
         rows = [r for r in rows if tag in json.loads(r.tags_json or "[]")]
     return rows

@@ -75,3 +75,31 @@ def test_refresh_without_usable_account_conflicts(client, auth_headers, second_a
         ).status_code
         == 404
     )
+
+
+def test_refresh_with_mismatched_work_id_maps_to_400(client, auth_headers, account_id):
+    """上游返回的作品 ID 与参考记录不一致：400，而不是裸 500。"""
+    from dataclasses import replace
+
+    from backend.app.adapters.douyin.fake import FakeDouyinAdapter
+    from backend.app.api.platforms.douyin import adapter_dependency
+
+    class _MismatchAdapter(FakeDouyinAdapter):
+        def crawl_work(self, cookie: str, url: str):
+            snapshot = super().crawl_work(cookie, url)
+            return replace(snapshot, provider_work_id="999999")
+
+    reference = client.post(
+        "/api/douyin/references/collect", json={"account_id": account_id, "url": URL},
+        headers=auth_headers,
+    ).json()["reference"]
+
+    client.app.dependency_overrides[adapter_dependency] = _MismatchAdapter
+    try:
+        response = client.post(
+            f"/api/douyin/works/{reference['id']}/refresh", json={}, headers=auth_headers
+        )
+        assert response.status_code == 400
+        assert "不一致" in response.json()["detail"]
+    finally:
+        client.app.dependency_overrides[adapter_dependency] = FakeDouyinAdapter
