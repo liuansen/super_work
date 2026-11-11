@@ -27,5 +27,7 @@ class AutoTask(Base):
     status: Mapped[str] = mapped_column(String(32), default="active")
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # SCH-2：执行前的原子领取标记；执行结束（成功/失败）后清空
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     total_published: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=shanghai_now)

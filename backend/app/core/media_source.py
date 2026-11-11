@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -50,6 +51,21 @@ def validate_media_file_name(name: str) -> str:
     return stripped
 
 
+_OWNED_MEDIA_RE = re.compile(r"^xhs-[a-z]+-u(\d+)-")
+
+
+def assert_owned_media_name(name: str, user_id: int) -> str:
+    """校验媒体文件名属于当前用户（文件名必须携带 xhs-*-u{user_id}- 前缀）。
+
+    防止用户 A 通过裸文件名引用用户 B 已上传的媒体（跨用户读文件）。
+    """
+    stripped = validate_media_file_name(name)
+    match = _OWNED_MEDIA_RE.match(stripped)
+    if match is None or int(match.group(1)) != int(user_id):
+        raise InvalidMediaSource(f"媒体文件不属于当前用户: {stripped[:64]}")
+    return stripped
+
+
 def validate_media_source(file_path: str) -> None:
     """校验发布素材来源；不合法时抛 InvalidMediaSource。"""
     if not file_path or not file_path.strip():
@@ -72,3 +88,20 @@ def validate_media_source(file_path: str) -> None:
 
     # 其余情况一律视为媒体目录内的纯文件名
     validate_media_file_name(fp)
+
+
+def validate_owned_media_source(source: str, user_id: int) -> str:
+    """素材来源校验 + 本地文件名归属校验（SEC-2 跨用户隔离）。
+
+    URL 形态只做白名单校验；本地文件名（含 /api/files/media/ 前缀形态）
+    还必须属于当前用户。校验失败抛 InvalidMediaSource。
+    """
+    fp = source.strip()
+    validate_media_source(fp)
+    if fp.startswith(("http://", "https://")):
+        return fp
+    if fp.startswith(MEDIA_URL_PATH_PREFIX):
+        assert_owned_media_name(fp[len(MEDIA_URL_PATH_PREFIX):], user_id)
+    else:
+        assert_owned_media_name(fp, user_id)
+    return fp

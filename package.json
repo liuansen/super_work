@@ -1,4 +1,8 @@
 {
+  "name": "super-work-signing-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Python 侧 JS 请求签名所需的 Node 运行时依赖（crypto-js / jsdom）。注意：Web 前端依赖在 frontend/package.json，与本文件互不相关。",
   "dependencies": {
     "crypto-js": "^4.2.0",
     "jsdom": "^26.0.0"

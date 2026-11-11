@@ -121,12 +121,14 @@ def get_owned_task(db: Session, user_id: int, task_id: int) -> Optional[DouyinPu
     )
 
 
-def list_tasks(db: Session, user_id: int) -> list[DouyinPublishTask]:
+def list_tasks(db: Session, user_id: int, limit: int = 200) -> list[DouyinPublishTask]:
+    # review P2：此前无上限，任务表增长后响应无界
     return list(
         db.scalars(
             select(DouyinPublishTask)
             .where(DouyinPublishTask.user_id == user_id)
             .order_by(DouyinPublishTask.id.desc())
+            .limit(limit)
         )
     )
 
@@ -162,7 +164,7 @@ def create_task(
 
     digest = _payload_digest(
         {
-            "account_id": account.id, "kind": kind, "media_names": sorted(media_names),
+            "account_id": account.id, "kind": kind, "media_names": media_names,
             "title": title, "description": description, "visibility": visibility,
             "allow_download": allow_download,
             "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
@@ -216,7 +218,8 @@ def _verify_idempotent_payload(existing: DouyinPublishTask, digest: str) -> None
     existing_digest = _payload_digest(
         {
             "account_id": existing.account_id, "kind": existing.kind,
-            "media_names": sorted(json.loads(existing.media_names_json or "[]")),
+            # 不排序：媒体顺序（图集页序）是载荷语义的一部分，重排即异载荷。
+            "media_names": json.loads(existing.media_names_json or "[]"),
             "title": existing.title, "description": existing.description,
             "visibility": existing.visibility, "allow_download": existing.allow_download,
             "scheduled_at": existing.scheduled_at.isoformat() if existing.scheduled_at else None,

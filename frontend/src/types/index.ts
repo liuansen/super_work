@@ -127,6 +127,7 @@ export type XhsDataCrawlPayload = {
   max_notes?: number;
   time_sleep?: number;
   fetch_comments?: boolean;
+  save_to_library?: boolean;
   sort_type_choice?: number;
   note_type?: number;
   note_time?: number;
@@ -632,6 +633,7 @@ export type PublishAsset = {
   publish_job_id: number;
   asset_type: "image" | "video" | string;
   file_path: string;
+  download_url?: string;
   upload_status: "pending" | "uploading" | "uploaded" | "failed" | string;
   creator_media_id: string;
   upload_error: string;

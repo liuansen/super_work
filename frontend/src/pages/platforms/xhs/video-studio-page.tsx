@@ -16,11 +16,11 @@ export function XhsVideoStudioPage() {
       />
 
       <Card
-        style={{ background: "#1a1a1a", borderRadius: 8, border: "1px solid #303030" }}
+        style={{ background: "var(--app-panel-bg)", borderRadius: 8, border: "1px solid var(--app-border)" }}
         styles={{ body: { padding: 48 } }}
       >
         <Empty
-          image={<VideoCameraOutlined style={{ fontSize: 64, color: "#8c8c8c" }} />}
+          image={<VideoCameraOutlined style={{ fontSize: 64, color: "var(--app-text-tertiary)" }} />}
           imageStyle={{ height: 80 }}
           description={
             <div>

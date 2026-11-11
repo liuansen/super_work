@@ -211,7 +211,7 @@ export function TaskCenterPage() {
     },
   ];
 
-  const cardStyle = { background: "#1f1f1f", borderColor: "#303030" };
+  const cardStyle = { background: "var(--app-surface-alt)", borderColor: "var(--app-border)" };
 
   return (
     <div>

@@ -65,7 +65,7 @@ function ModelTypeIcon({ type }: { type: ModelType }) {
   return type === "text" ? <RobotOutlined /> : <FileImageOutlined />;
 }
 
-const cardStyle = { background: "#1f1f1f", borderColor: "#303030" };
+const cardStyle = { background: "var(--app-surface-alt)", borderColor: "var(--app-border)" };
 
 export function ModelConfigPage() {
   const [configs, setConfigs] = useState<ModelConfig[]>([]);
@@ -417,8 +417,8 @@ export function ModelConfigPage() {
                           key={config.id}
                           size="small"
                           style={{
-                            background: "#262626",
-                            borderColor: "#303030",
+                            background: "var(--app-elevated)",
+                            borderColor: "var(--app-border)",
                           }}
                         >
                           <Space

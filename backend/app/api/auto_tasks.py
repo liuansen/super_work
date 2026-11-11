@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
-from sqlalchemy import select
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from backend.app.api.platforms.xhs.crawl import _data_items, _normalize_search_item
+from backend.app.services.xhs_normalizers import (
+    data_items as _data_items,
+    normalize_search_item as _normalize_search_item,
+)
+from backend.app.api.publish import get_creator_publish_adapter_factory
 from backend.app.api.platforms.xhs.pc import (
     _get_owned_pc_account_cookies,
     get_xhs_pc_api_adapter_factory,
@@ -31,10 +36,29 @@ from backend.app.models import (
     Task,
     User,
 )
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 from backend.app.services.ai_service import OpenAICompatibleTextClient
 
 router = APIRouter(prefix="/auto-tasks", tags=["auto-tasks"])
+
+# review P1：schedule_time 之前只校验长度，写进 "abcde" 会让 _calculate_next_run_at
+# 抛 ValueError；调度器吞掉异常后 next_run_at 滞留在过去，于是每分钟重复发布一次。
+_SCHEDULE_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _normalize_schedule_time(value: str) -> str:
+    text = (value or "").strip()
+    if not _SCHEDULE_TIME_RE.match(text):
+        raise ValueError("schedule_time 必须为 HH:MM（24 小时制，例如 09:30）")
+    return text
+
+
+def _parse_schedule_time(value: str | None) -> tuple[int, int] | None:
+    """解析 HH:MM；非法值返回 None（调用方据此停止排期，不再让异常逃逸）。"""
+    match = _SCHEDULE_TIME_RE.match((value or "").strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 class AutoTaskCreateRequest(BaseModel):
@@ -48,6 +72,11 @@ class AutoTaskCreateRequest(BaseModel):
     schedule_days: str = Field(default="", max_length=64)
     schedule_interval_hours: int = Field(default=24, ge=1, le=168)
 
+    @field_validator("schedule_time")
+    @classmethod
+    def _validate_schedule_time(cls, value: str) -> str:
+        return _normalize_schedule_time(value)
+
 
 class AutoTaskUpdateRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=128)
@@ -58,6 +87,11 @@ class AutoTaskUpdateRequest(BaseModel):
     schedule_time: Optional[str] = Field(default=None, max_length=5)
     schedule_days: Optional[str] = Field(default=None, max_length=64)
     schedule_interval_hours: Optional[int] = Field(default=None, ge=1, le=168)
+
+    @field_validator("schedule_time")
+    @classmethod
+    def _validate_schedule_time(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else _normalize_schedule_time(value)
 
 
 def _serialize_auto_task(task: AutoTask) -> dict[str, Any]:
@@ -123,25 +157,48 @@ def _calculate_next_run_at(task: AutoTask) -> None:
     now = shanghai_now()
     if task.schedule_type == "manual":
         task.next_run_at = None
-    elif task.schedule_type == "daily":
-        h, m = (task.schedule_time or "09:00").split(":")
-        next_time = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-        if next_time <= now:
-            next_time += timedelta(days=1)
-        task.next_run_at = next_time
-    elif task.schedule_type == "weekly":
-        h, m = (task.schedule_time or "09:00").split(":")
+    elif task.schedule_type in ("daily", "weekly"):
+        parsed = _parse_schedule_time(task.schedule_time)
+        if parsed is None:
+            # 历史脏数据兜底：宁可停排，也不能让 next_run_at 滞留在过去导致每分钟发布
+            logger.warning(
+                "auto task %s 的 schedule_time 非法(%r)，已停止排期",
+                task.id,
+                task.schedule_time,
+            )
+            task.next_run_at = None
+            return
+        h, m = parsed
+        if task.schedule_type == "daily":
+            next_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            if next_time <= now:
+                next_time += timedelta(days=1)
+            task.next_run_at = next_time
+            return
         days = [int(d) for d in (task.schedule_days or "").split(",") if d.strip().isdigit()]
         if not days:
             task.next_run_at = None
             return
-        for offset in range(1, 8):
+        # SCH-6：从 offset=0 开始——配置为"今天"时，当天目标时刻尚未过去就应排到今天执行
+        for offset in range(0, 8):
             candidate = now + timedelta(days=offset)
             if candidate.isoweekday() in days:
-                task.next_run_at = candidate.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-                return
+                candidate_time = candidate.replace(hour=h, minute=m, second=0, microsecond=0)
+                if candidate_time > now:
+                    task.next_run_at = candidate_time
+                    return
+        task.next_run_at = None
     elif task.schedule_type == "interval":
         task.next_run_at = now + timedelta(hours=task.schedule_interval_hours)
+    else:
+        # 未知 schedule_type（DB 直改脏数据）与 schedule_time 脏数据同语义：
+        # 停止排期，绝不能让 next_run_at 滞留在过去导致每个 tick 重复执行
+        logger.warning(
+            "auto task %s 的 schedule_type 未知(%r)，已停止排期",
+            task.id,
+            task.schedule_type,
+        )
+        task.next_run_at = None
 
 
 @router.get("")
@@ -151,12 +208,15 @@ def list_auto_tasks(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    tasks = db.scalars(
-        select(AutoTask)
-        .where(AutoTask.user_id == current_user.id)
-        .order_by(AutoTask.created_at.desc(), AutoTask.id.desc())
-    ).all()
-    return paginated([_serialize_auto_task(t) for t in tasks], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        select(AutoTask).where(AutoTask.user_id == current_user.id),
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_auto_task,
+        order_by=(AutoTask.created_at.desc(), AutoTask.id.desc()),
+    )
 
 
 @router.post("")
@@ -245,26 +305,133 @@ def run_auto_task(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     adapter_factory=Depends(get_xhs_pc_api_adapter_factory),
+    publish_adapter_factory=Depends(get_creator_publish_adapter_factory),
 ):
+    """手动运行一次自动运营任务（= 搜索 → 改写 → 发布）。
+
+    执行体在后台线程池中跑（见 services/job_runner.py）：
+    - 阈值内完成：直接返回完整结果（保持原有前端契约）；
+    - 超过 TASK_SYNC_WAIT_SECONDS：返回 202 + 任务 ID，前端到任务中心查看。
+    这样上游变慢时不会挂死请求线程、拖垮整站。
+    """
     auto_task = _get_owned_auto_task(db, current_user, task_id)
 
-    # Verify account ownership
+    # 轻量校验留在请求线程：账号不存在等错误应立即 404，而不是排进队列
     _verify_account_ownership(db, current_user, auto_task.pc_account_id, "pc")
     _verify_account_ownership(db, current_user, auto_task.creator_account_id, "creator")
 
-    # Create a tracking task
+    # 先落一条运行记录：超时返回 202 时前端据此轮询
     tracking_task = Task(
         user_id=current_user.id,
         platform="xhs",
         task_type="auto_ops_run",
         status="running",
-        progress=10,
+        progress=5,
         payload={"auto_task_id": auto_task.id, "auto_task_name": auto_task.name},
     )
     db.add(tracking_task)
-    db.flush()
+    db.commit()
+    db.refresh(tracking_task)
 
-    # 1. Pick a random keyword
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    from backend.app.services import job_runner
+
+    future = job_runner.submit(
+        _execute_auto_ops_run,
+        auto_task_id=auto_task.id,
+        user_id=current_user.id,
+        bind=db.get_bind(),
+        tracking_task_id=tracking_task.id,
+        adapter_factory=adapter_factory,
+        publish_adapter_factory=publish_adapter_factory,
+    )
+    try:
+        return future.result(timeout=job_runner.sync_wait_seconds())
+    except FutureTimeout:
+        logger.info(
+            "auto task %s 手动运行超过同步阈值，转后台（tracking_task=%s）",
+            auto_task.id,
+            tracking_task.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_202_ACCEPTED,
+            detail={
+                "status": "accepted",
+                "task_id": tracking_task.id,
+                "message": "任务已转入后台执行，请在任务中心查看进度",
+            },
+        )
+
+
+def _execute_auto_ops_run(
+    *,
+    auto_task_id: int,
+    user_id: int,
+    bind,
+    tracking_task_id: int,
+    adapter_factory,
+    publish_adapter_factory,
+) -> dict:
+    """后台执行体：自带 session（不可复用请求线程的 Session）。"""
+    from sqlalchemy.orm import Session as _Session
+
+    db = _Session(bind=bind)
+    try:
+        auto_task = db.get(AutoTask, auto_task_id)
+        current_user = db.get(User, user_id)
+        tracking_task = db.get(Task, tracking_task_id)
+        if auto_task is None or current_user is None or tracking_task is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Auto task not found",
+            )
+        tracking_task.progress = 10
+        db.commit()
+        try:
+            return _run_auto_ops_pipeline(
+                db,
+                auto_task=auto_task,
+                current_user=current_user,
+                tracking_task=tracking_task,
+                adapter_factory=adapter_factory,
+                publish_adapter_factory=publish_adapter_factory,
+            )
+        except HTTPException as exc:
+            _mark_run_failed(db, tracking_task, str(exc.detail))
+            raise
+        except Exception as exc:
+            _mark_run_failed(db, tracking_task, str(exc)[:500])
+            raise
+    finally:
+        db.close()
+
+
+def _mark_run_failed(db: Session, tracking_task: Task, message: str) -> None:
+    try:
+        db.rollback()
+        task = db.get(Task, tracking_task.id)
+        if task is not None:
+            task.status = "failed"
+            task.progress = 100
+            task.payload = {**(task.payload or {}), "error": message[:500]}
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("标记运行记录失败: task=%s", tracking_task.id, exc_info=True)
+
+
+def _run_auto_ops_pipeline(
+    db: Session,
+    *,
+    auto_task: AutoTask,
+    current_user: User,
+    tracking_task: Task,
+    adapter_factory,
+    publish_adapter_factory,
+) -> dict:
+    """搜索 → 选优 → AI 改写 → 建发布任务 → 立即发布（原 run_auto_task 主体）。"""
+    # 1. Pick a random keyword    # 1. Pick a random keyword
     keywords = auto_task.keywords or []
     if not keywords:
         tracking_task.status = "failed"
@@ -407,8 +574,6 @@ def run_auto_task(
                 ))
 
     # 7. Update auto task run time.
-    # 注意：此处仅创建了 pending 的 PublishJob，真实发布尚未发生（也不保证成功），
-    # total_published 由真正发布成功的调度链路递增，不在创建时计数。
     auto_task.last_run_at = shanghai_now()
     _calculate_next_run_at(auto_task)
 
@@ -424,6 +589,94 @@ def run_auto_task(
     db.refresh(auto_task)
     db.refresh(draft)
     db.refresh(publish_job)
+
+    # SCH-5（W0-3 决策：手动"运行"= 真正发布）：与手动发布/调度器共用同一执行器。
+    # 先原子领取，再执行；total_published 由执行器链路在发布成功后递增。
+    # review P1-1：手动运行同样领取 auto_tasks.claimed_at，
+    # 防止调度器 tick 与手动运行并发重复执行同一任务
+    from backend.app.services.scheduler_service import _claim_auto_task, _release_auto_task_claim
+
+    if not _claim_auto_task(db, auto_task.id):
+        db.refresh(publish_job)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="该自动运营任务正在被调度器执行，请稍后再试",
+        )
+    try:
+        return _finish_manual_auto_task_run(
+            db,
+            auto_task=auto_task,
+            current_user=current_user,
+            publish_job=publish_job,
+            keyword=keyword,
+            best_note=best_note,
+            draft=draft,
+            adapter_factory=publish_adapter_factory,
+        )
+    finally:
+        _release_auto_task_claim(db, auto_task.id)
+
+
+def _finish_manual_auto_task_run(
+    db: Session,
+    *,
+    auto_task: AutoTask,
+    current_user: User,
+    publish_job: PublishJob,
+    keyword: str,
+    best_note: dict,
+    draft: AiDraft,
+    adapter_factory=None,
+) -> dict:
+    """手动运行的发布执行段（调用方已完成 auto task 原子领取）。
+
+    keyword / best_note / draft 由调用方显式传入：它们只存在于 run_auto_task
+    的局部作用域，早期版本在这里直接引用会抛 NameError（且发布已经完成并提交，
+    用户看到 500 后重试会造成重复发布）。
+    """
+    publish_status = publish_job.status
+    publish_error = ""
+    creator_account = db.get(PlatformAccount, auto_task.creator_account_id)
+    if (
+        creator_account is not None
+        and creator_account.platform == "xhs"
+        and creator_account.sub_type == "creator"
+    ):
+        from backend.app.api.publish import execute_claimed_publish_job
+        from backend.app.models import PublishJob
+        from backend.app.core.time import shanghai_now as _now
+
+        claimed = db.execute(
+            update(PublishJob)
+            .where(
+                PublishJob.id == publish_job.id,
+                PublishJob.status.not_in(("publishing", "uploading", "published", "scheduled")),
+            )
+            .values(status="publishing", publish_started_at=_now())
+        )
+        db.commit()
+        if claimed.rowcount == 1:
+            db.refresh(publish_job)
+            try:
+                execute_claimed_publish_job(
+                    db,
+                    job=publish_job,
+                    account=creator_account,
+                    current_user=current_user,
+                    adapter_factory=(adapter_factory or get_creator_publish_adapter_factory()),
+                )
+            except HTTPException as exc:
+                publish_error = str(exc.detail)
+            except Exception as exc:  # 网络等非 HTTP 异常也要反馈给用户
+                publish_error = str(exc)[:300]
+            db.refresh(publish_job)
+            publish_status = publish_job.status
+        else:
+            publish_status = "conflict"
+    else:
+        # 账号不是 Creator：明确告知用户任务已排队但不会执行
+        publish_error = "自动运营绑定的不是 Creator（专业号）账号，任务已创建但不会自动发布"
+        publish_status = "pending"
 
     return {
         "auto_task": _serialize_auto_task(auto_task),
@@ -443,7 +696,8 @@ def run_auto_task(
         },
         "publish_job": {
             "id": publish_job.id,
-            "status": publish_job.status,
+            "status": publish_status,
+            "publish_error": publish_error,
             "platform_account_id": publish_job.platform_account_id,
         },
     }

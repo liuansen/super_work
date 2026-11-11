@@ -288,7 +288,7 @@ export function XhsImageStudioPage() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          background: "#1a1a1a",
+                          background: "var(--app-panel-bg)",
                         }}
                       >
                         <PictureOutlined style={{ fontSize: 20, color: "#666" }} />
@@ -330,7 +330,7 @@ export function XhsImageStudioPage() {
                     alignItems: "center",
                     justifyContent: "center",
                     cursor: "pointer",
-                    background: "#1a1a1a",
+                    background: "var(--app-panel-bg)",
                   }}
                 >
                   <PlusOutlined style={{ fontSize: 20, color: "#666" }} />
@@ -383,7 +383,7 @@ export function XhsImageStudioPage() {
                 </Text>
                 <div
                   style={{
-                    background: "#1a1a1a",
+                    background: "var(--app-panel-bg)",
                     borderRadius: 6,
                     padding: 8,
                     textAlign: "center",
@@ -453,7 +453,7 @@ export function XhsImageStudioPage() {
             {description && (
               <Paragraph
                 style={{
-                  background: "#262626",
+                  background: "var(--app-elevated)",
                   padding: 12,
                   borderRadius: 6,
                   fontSize: 13,
@@ -508,7 +508,7 @@ export function XhsImageStudioPage() {
                               marginBottom: 6,
                               overflow: "hidden",
                               borderRadius: 4,
-                              background: "#1a1a1a",
+                              background: "var(--app-panel-bg)",
                             }}
                           >
                             {isRenderableImage(asset.file_path) ? (
@@ -615,7 +615,7 @@ export function XhsImageStudioPage() {
                               marginBottom: 6,
                               overflow: "hidden",
                               borderRadius: 4,
-                              background: "#1a1a1a",
+                              background: "var(--app-panel-bg)",
                             }}
                           >
                             <Image
@@ -701,7 +701,7 @@ export function XhsImageStudioPage() {
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
-                            background: "#1a1a1a",
+                            background: "var(--app-panel-bg)",
                           }}
                         >
                           <img
@@ -748,7 +748,7 @@ export function XhsImageStudioPage() {
                             display: "flex",
                             alignItems: "center",
                             justifyContent: "center",
-                            background: "#1a1a1a",
+                            background: "var(--app-panel-bg)",
                           }}
                         >
                           {isRenderableImage(asset.file_path) ? (

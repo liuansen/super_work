@@ -35,6 +35,16 @@ def public_http_url_error(url: str, *, resolve_dns: bool = True, block_private: 
     if not host:
         return "URL 缺少主机名"
 
+    if not resolve_dns:
+        # 跳过 DNS 时仍校验字面 IP（保存时快速检查：协议 + 字面 IP 段）
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return None  # 域名形态：完整校验留到请求时做 DNS 解析
+        if _ip_forbidden(str(ip), block_private=block_private):
+            return f"不允许访问保留/内网地址: {host}"
+        return None
+
     if resolve_dns:
         try:
             infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), proto=socket.IPPROTO_TCP)

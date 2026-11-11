@@ -17,8 +17,10 @@ import { Alert, Badge, Button, Card, Col, Descriptions, Drawer, Empty, Input, Ro
 import { FormEvent, MouseEvent, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { fetchAccounts, fetchSavedNoteIds, fetchXhsNoteComments, fetchXhsNoteDetail, saveXhsNotesToLibrary, searchXhsNotes } from "../../../lib/api";
-import type { NoteComment, PlatformAccount, XhsSearchNote, XhsSearchOptions } from "../../../types";
+import { useLatestRequest } from "../../../hooks/use-latest-request";
+import { useAccounts } from "../../../hooks/use-accounts";
+import { fetchSavedNoteIds, fetchXhsNoteComments, fetchXhsNoteDetail, saveXhsNotesToLibrary, searchXhsNotes } from "../../../lib/api";
+import type { NoteComment, XhsSearchNote, XhsSearchOptions } from "../../../types";
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -71,15 +73,15 @@ function getNoteKindLabel(note: XhsSearchNote): "视频" | "图文" {
 function stopCardClick(e: MouseEvent<HTMLElement>) { e.stopPropagation(); }
 
 export function XhsDiscoveryPage() {
-  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const { accounts, isLoading: isLoadingAccounts, refresh: refreshAccounts } = useAccounts("xhs");
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [keyword, setKeyword] = useState("");
   const [noteUrl, setNoteUrl] = useState("");
   const [filters, setFilters] = useState({ sort_type_choice: 0, note_type: 0, note_time: 0, note_range: 0, pos_distance: 0, geo: "" });
+  const request = useLatestRequest();
   const [notes, setNotes] = useState<XhsSearchNote[]>([]);
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
-  const [isLoadingAccounts, setIsLoadingAccounts] = useState(true);
   const [isSearching, setIsSearching] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [isFetchingUrl, setIsFetchingUrl] = useState(false);
@@ -99,9 +101,11 @@ export function XhsDiscoveryPage() {
   const pcAccountOptions = useMemo(() => pcAccounts.map((a) => ({ value: a.id, label: `${a.nickname || `PC ${a.id}`} · ${a.status}` })), [pcAccounts]);
 
   async function loadAccounts() {
-    setIsLoadingAccounts(true); setError(null);
-    try { const loaded = await fetchAccounts("xhs"); setAccounts(loaded); const first = loaded.find((a) => a.sub_type === "pc"); setSelectedAccountId((c) => c ?? first?.id ?? null); }
-    catch { setError("账号列表加载失败。"); } finally { setIsLoadingAccounts(false); }
+    setError(null);
+    const result = await refreshAccounts();
+    const loaded = result.data ?? [];
+    const first = loaded.find((a) => a.sub_type === "pc");
+    setSelectedAccountId((c) => c ?? first?.id ?? null);
   }
 
   function searchPayload(nextPage: number): XhsSearchOptions | null {
@@ -112,18 +116,26 @@ export function XhsDiscoveryPage() {
 
   async function runSearch(nextPage: number, append: boolean) {
     const payload = searchPayload(nextPage); if (!payload) return;
-    setError(null); append ? setIsLoadingMore(true) : setIsSearching(true);
+    const seq = request.begin();
+    setError(null);
+    if (append) setIsLoadingMore(true);
+    else setIsSearching(true);
     try {
       const result = await searchXhsNotes(payload);
+      // review P1：连续搜索时旧关键词的慢响应不得覆盖新结果
+      if (!request.isLatest(seq)) return;
       setNotes((c) => append ? [...c, ...result.items] : result.items);
       setPage(result.page); setHasMore(result.has_more);
       void loadSavedNoteIds();
       setCommentPreviewByNoteId((c) => append ? c : {}); setCommentPreviewErrors((c) => append ? c : {}); setSearchedKeyword(payload.keyword);
-    } catch (err: unknown) { const a = err as { response?: { status?: number; data?: { detail?: string } }; message?: string }; setError(a?.response?.data?.detail ? `[${a.response.status}] ${a.response.data.detail}` : `搜索失败：${a?.message || "请检查网络和后端服务"}`); }
-    finally { setIsSearching(false); setIsLoadingMore(false); }
+    } catch (err: unknown) {
+      if (!request.isLatest(seq)) return;
+      const a = err as { response?: { status?: number; data?: { detail?: string } }; message?: string };
+      setError(a?.response?.data?.detail ? `[${a.response.status}] ${a.response.data.detail}` : `搜索失败：${a?.message || "请检查网络和后端服务"}`);
+    }
+    finally { if (request.isLatest(seq)) { setIsSearching(false); setIsLoadingMore(false); } }
   }
 
-  async function handleSearch(e: FormEvent) { e.preventDefault(); await runSearch(1, false); }
   async function handleLoadMore() { await runSearch(page + 1, true); }
 
   async function loadSavedNoteIds() {
@@ -233,15 +245,15 @@ export function XhsDiscoveryPage() {
                   <Col xs={12} sm={8} md={6} lg={4} xl={4} key={`${note.note_id}-${note.title}`}>
                     <Card hoverable size="small" style={{ overflow: "hidden" }} onClick={() => void openDetail(note)}
                       cover={
-                        <div style={{ position: "relative", background: "#262626" }}>
+                        <div style={{ position: "relative", background: "var(--app-elevated)" }}>
                           {coverUrl
                             ? <img src={coverUrl} alt={note.title || "封面"} referrerPolicy="no-referrer" style={{ width: "100%", aspectRatio: "1/1", objectFit: "cover", display: "block" }} />
-                            : <div style={{ width: "100%", aspectRatio: "1/1", display: "flex", alignItems: "center", justifyContent: "center", color: "rgba(255,255,255,.2)", fontSize: 28 }}><PictureOutlined /></div>}
+                            : <div style={{ width: "100%", aspectRatio: "1/1", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--app-text-disabled)", fontSize: 28 }}><PictureOutlined /></div>}
                           <Tag color={kind === "视频" ? "purple" : "blue"} style={{ position: "absolute", top: 8, left: 8 }} icon={kind === "视频" ? <PlayCircleOutlined /> : <PictureOutlined />}>{kind}</Tag>
                         </div>
                       }>
                       <Card.Meta title={<Text ellipsis style={{ fontSize: 13 }}>{note.title || "未命名笔记"}</Text>} description={<><Text type="secondary" style={{ fontSize: 12 }}>{note.author_name || "未知作者"}</Text>{formatNoteTime(note) && <Text type="secondary" style={{ fontSize: 11, marginLeft: 8 }}>{formatNoteTime(note)}</Text>}</>} />
-                      <Space size={12} style={{ marginTop: 8, fontSize: 12, color: "rgba(255,255,255,.45)" }}>
+                      <Space size={12} style={{ marginTop: 8, fontSize: 12, color: "var(--app-text-tertiary-weak)" }}>
                         <span><HeartOutlined /> {formatMetric(note.likes)}</span>
                         <span><StarOutlined /> {formatMetric(note.collects)}</span>
                         <span><CommentOutlined /> {formatMetric(note.comments)}</span>
@@ -257,16 +269,16 @@ export function XhsDiscoveryPage() {
                       </div>
                       {commentPreviewErrors[note.note_id] && <Alert message={commentPreviewErrors[note.note_id]} type="error" style={{ marginTop: 8, fontSize: 12 }} showIcon />}
                       {commentPreviewByNoteId[note.note_id] && (
-                        <div style={{ marginTop: 8, borderTop: "1px solid #303030", paddingTop: 8 }} onClick={stopCardClick}>
+                        <div style={{ marginTop: 8, borderTop: "1px solid var(--app-border)", paddingTop: 8 }} onClick={stopCardClick}>
                           {commentPreviewByNoteId[note.note_id].length === 0 ? <Text type="secondary" style={{ fontSize: 12 }}>暂无评论</Text> : null}
                           {commentPreviewByNoteId[note.note_id].filter((c) => !c.parent_comment_id).slice(0, 4).map((c) => (
                             <div key={c.comment_id} style={{ marginBottom: 6, fontSize: 12 }}>
                               <Text strong style={{ fontSize: 12 }}>{c.user_name}</Text> <Text type="secondary" style={{ fontSize: 11 }}>{c.created_at_remote} · {c.like_count} likes</Text>
-                              <div style={{ color: "rgba(255,255,255,.65)" }}>{c.content}</div>
+                              <div style={{ color: "var(--app-text-secondary)" }}>{c.content}</div>
                               {getChildComments(note.note_id, c.comment_id).map((r) => (
                                 <div key={r.comment_id} style={{ marginLeft: 16, marginTop: 4 }}>
                                   <Text strong style={{ fontSize: 11 }}>{r.user_name}</Text> <Text type="secondary" style={{ fontSize: 11 }}>{r.like_count} likes</Text>
-                                  <div style={{ color: "rgba(255,255,255,.55)", fontSize: 12 }}>{r.content}</div>
+                                  <div style={{ color: "var(--app-text-secondary)", fontSize: 12 }}>{r.content}</div>
                                 </div>
                               ))}
                             </div>
@@ -285,22 +297,22 @@ export function XhsDiscoveryPage() {
         )}
       </Card>
 
-      <Drawer title={selectedNote?.title || "笔记详情"} open={!!selectedNote} onClose={closeDetail} width={640} styles={{ body: { background: "#1a1a1a" } }}>
+      <Drawer title={selectedNote?.title || "笔记详情"} open={!!selectedNote} onClose={closeDetail} width={640} styles={{ body: { background: "var(--app-panel-bg)" } }}>
         {selectedNote && (
           <div>
             {isFetchingDetail && <Spin style={{ display: "block", textAlign: "center", margin: "16px 0" }} />}
             {detailError && <Alert message={detailError} type="warning" showIcon style={{ marginBottom: 12 }} />}
             {selVideoUrl && getNoteKindLabel(selectedNote) === "视频" ? (
               <div style={{ marginBottom: 16 }}>
-                <div style={{ position: "relative", background: "#262626", borderRadius: 8, overflow: "hidden" }}>
-                  {selImgUrls.length ? <img src={selImgUrls[0]} alt="视频封面" referrerPolicy="no-referrer" style={{ width: "100%", maxHeight: 400, objectFit: "contain", display: "block" }} /> : <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center" }}><PlayCircleOutlined style={{ fontSize: 40, color: "rgba(255,255,255,.3)" }} /></div>}
+                <div style={{ position: "relative", background: "var(--app-elevated)", borderRadius: 8, overflow: "hidden" }}>
+                  {selImgUrls.length ? <img src={selImgUrls[0]} alt="视频封面" referrerPolicy="no-referrer" style={{ width: "100%", maxHeight: 400, objectFit: "contain", display: "block" }} /> : <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center" }}><PlayCircleOutlined style={{ fontSize: 40, color: "var(--app-text-disabled)" }} /></div>}
                   <Tag color="purple" style={{ position: "absolute", top: 8, left: 8 }}><PlayCircleOutlined /> 视频封面</Tag>
                 </div>
                 <Button type="primary" icon={<LinkOutlined />} href={selVideoUrl} target="_blank" rel="noreferrer" style={{ marginTop: 8 }} block>打开视频</Button>
               </div>
             ) : selImgUrls.length ? (
               <div style={{ marginBottom: 16 }}>
-                <div style={{ position: "relative", background: "#262626", borderRadius: 8, overflow: "hidden", textAlign: "center" }}>
+                <div style={{ position: "relative", background: "var(--app-elevated)", borderRadius: 8, overflow: "hidden", textAlign: "center" }}>
                   <img src={selImgUrls[selMediaIdx]} alt="笔记图片" referrerPolicy="no-referrer" style={{ maxWidth: "100%", maxHeight: 400, objectFit: "contain" }} />
                   {selImgUrls.length > 1 && (
                     <>
@@ -334,7 +346,7 @@ export function XhsDiscoveryPage() {
 
             <div style={{ marginBottom: 16 }}>
               <Text strong>正文</Text>
-              <Paragraph style={{ marginTop: 4, color: "rgba(255,255,255,.65)" }}>{selectedNote.content || "暂无正文。"}</Paragraph>
+              <Paragraph style={{ marginTop: 4, color: "var(--app-text-secondary)" }}>{selectedNote.content || "暂无正文。"}</Paragraph>
             </div>
 
             <Space wrap style={{ marginBottom: 16 }}>
@@ -350,16 +362,16 @@ export function XhsDiscoveryPage() {
 
             {commentPreviewErrors[selectedNote.note_id] && <Alert message={commentPreviewErrors[selectedNote.note_id]} type="error" showIcon style={{ marginBottom: 12 }} />}
             {commentPreviewByNoteId[selectedNote.note_id] && (
-              <Card size="small" title="评论预览" style={{ background: "#1f1f1f" }}>
+              <Card size="small" title="评论预览" style={{ background: "var(--app-surface-alt)" }}>
                 {commentPreviewByNoteId[selectedNote.note_id].length === 0 ? <Text type="secondary">暂无评论</Text> : null}
                 {commentPreviewByNoteId[selectedNote.note_id].filter((c) => !c.parent_comment_id).map((c) => (
-                  <div key={c.comment_id} style={{ marginBottom: 12, paddingBottom: 8, borderBottom: "1px solid #303030" }}>
+                  <div key={c.comment_id} style={{ marginBottom: 12, paddingBottom: 8, borderBottom: "1px solid var(--app-border)" }}>
                     <Space><Text strong style={{ fontSize: 13 }}>{c.user_name}</Text><Text type="secondary" style={{ fontSize: 11 }}>{c.created_at_remote} · {c.like_count} likes</Text></Space>
-                    <div style={{ color: "rgba(255,255,255,.65)", fontSize: 13, marginTop: 2 }}>{c.content}</div>
+                    <div style={{ color: "var(--app-text-secondary)", fontSize: 13, marginTop: 2 }}>{c.content}</div>
                     {getChildComments(selectedNote.note_id, c.comment_id).map((r) => (
-                      <div key={r.comment_id} style={{ marginLeft: 20, marginTop: 6, paddingLeft: 8, borderLeft: "2px solid #303030" }}>
+                      <div key={r.comment_id} style={{ marginLeft: 20, marginTop: 6, paddingLeft: 8, borderLeft: "2px solid var(--app-border)" }}>
                         <Space><Text strong style={{ fontSize: 12 }}>{r.user_name}</Text><Text type="secondary" style={{ fontSize: 11 }}>{r.like_count} likes</Text></Space>
-                        <div style={{ color: "rgba(255,255,255,.55)", fontSize: 12 }}>{r.content}</div>
+                        <div style={{ color: "var(--app-text-secondary)", fontSize: 12 }}>{r.content}</div>
                       </div>
                     ))}
                   </div>

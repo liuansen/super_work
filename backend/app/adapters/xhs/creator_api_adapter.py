@@ -74,7 +74,9 @@ class XhsCreatorApiAdapter:
                 file_name = file_path[len(MEDIA_URL_PATH_PREFIX):]
             else:
                 file_name = file_path
-            local = pathlib.Path(get_settings().storage_dir) / "media" / file_name
+            from backend.app.core.media_storage import media_path
+
+            local = media_path(file_name)
             if local.is_file():
                 raw_bytes = local.read_bytes()
 

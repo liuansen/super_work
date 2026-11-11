@@ -80,9 +80,12 @@ import type {
 const http = axios.create({
   baseURL: "/api",
   timeout: 120000,
+  // SEC-7/FE-6：refresh token 改为 HttpOnly Cookie，跨端携带 cookie
+  withCredentials: true
 });
 
-const REFRESH_TOKEN_KEY = "spider_xhs_refresh_token";
+export const httpInstance = http; // 导出供测试注入 mock adapter（FE-18）
+
 let accessToken: string | null = null;
 
 export type AuthCredentials = {
@@ -94,12 +97,19 @@ export function getAccessToken(): string | null {
   return accessToken;
 }
 
-export function hasRefreshToken(): boolean {
-  return Boolean(window.localStorage.getItem(REFRESH_TOKEN_KEY));
+/** 认证过期回调注册表（FE-5）：刷新失败时通知认证层更新 store 并跳转登录页 */
+type AuthExpiredListener = () => void;
+const authExpiredListeners = new Set<AuthExpiredListener>();
+
+export function onAuthExpired(listener: AuthExpiredListener): () => void {
+  authExpiredListeners.add(listener);
+  return () => {
+    authExpiredListeners.delete(listener);
+  };
 }
 
-function getRefreshToken(): string | null {
-  return window.localStorage.getItem(REFRESH_TOKEN_KEY);
+function notifyAuthExpired(): void {
+  authExpiredListeners.forEach((listener) => listener());
 }
 
 function setAccessToken(token: string | null): void {
@@ -108,15 +118,12 @@ function setAccessToken(token: string | null): void {
 
 function persistAuthPayload(payload: AuthPayload): AuthPayload {
   setAccessToken(payload.access_token);
-  if (payload.refresh_token) {
-    window.localStorage.setItem(REFRESH_TOKEN_KEY, payload.refresh_token);
-  }
+  // FE-6：refresh token 不再落 localStorage（后端已改用 HttpOnly Cookie）
   return payload;
 }
 
 export function clearAuthTokens(): void {
   setAccessToken(null);
-  window.localStorage.removeItem(REFRESH_TOKEN_KEY);
 }
 
 http.interceptors.request.use((config) => {
@@ -126,25 +133,77 @@ http.interceptors.request.use((config) => {
   return config;
 });
 
-function isRefreshRequest(config?: { url?: string }): boolean {
-  return Boolean(config?.url && config.url.includes("/auth/refresh"));
+const AUTH_ENDPOINT_PATTERN = /\/auth\/(refresh|login|register)$/;
+
+function isAuthEndpoint(config?: { url?: string }): boolean {
+  return Boolean(config?.url && AUTH_ENDPOINT_PATTERN.test(config.url));
+}
+
+declare module "axios" {
+  // 项目内约定的请求级开关：_silent 表示错误由调用方展示，拦截器不弹 toast
+  interface AxiosRequestConfig {
+    _silent?: boolean;
+  }
+}
+
+/** 取消类错误（组件卸载/切换筛选触发的 AbortController）不应提示用户 */
+function isCanceledError(error: unknown): boolean {
+  return axios.isCancel(error) || (error as { code?: string })?.code === "ERR_CANCELED";
+}
+
+/**
+ * 统一从 API 错误中提取可展示文案。
+ * 页面层此前各自写 `(err as {...})?.response?.data?.detail`，8 处以上重复
+ * 且形状漂移；后续只改这一处。
+ */
+export function extractErrorMessage(error: unknown, fallback = "请求失败，请稍后重试"): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return detail;
+    }
+    if (Array.isArray(detail) && detail.length > 0) {
+      const first = detail[0] as { msg?: string };
+      if (first?.msg) return first.msg;
+    }
+    // 无 detail 时用调用方的中文兜底，而不是 axios 的英文
+    // "Request failed with status code 500"
+    return fallback;
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
+
+// 相同文案的 toast 去重节流：轮询类请求失败时不再刷屏
+let lastToastMessage = "";
+let lastToastAt = 0;
+function showErrorToast(msg: string): void {
+  const now = Date.now();
+  if (msg === lastToastMessage && now - lastToastAt < 3000) {
+    return;
+  }
+  lastToastMessage = msg;
+  lastToastAt = now;
+  message.error(msg);
 }
 
 http.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config as typeof error.config & { _authRetry?: boolean; _silent?: boolean };
-    // 关键：refresh 请求自身的 401 绝不能再触发刷新，否则会无限递归请求
+    // 关键：认证端点自身的 401 绝不能再触发刷新（FE-1 无限递归根因）。
+    // refresh token 由 HttpOnly Cookie 携带，客户端无从判断是否存在，
+    // 统一跳过刷新逻辑，由 401 直接进入失败分支
     if (
       error.response?.status !== 401 ||
       originalRequest?._authRetry ||
-      isRefreshRequest(originalRequest) ||
-      !getRefreshToken()
+      isAuthEndpoint(originalRequest)
     ) {
-      if (!originalRequest?._silent) {
-        const detail = error.response?.data?.detail;
-        const msg = typeof detail === "string" ? detail : "请求失败，请稍后重试";
-        message.error(msg);
+      // review P1：取消类错误不是故障，静默传递给调用方
+      if (!originalRequest?._silent && !isCanceledError(error)) {
+        showErrorToast(extractErrorMessage(error));
       }
       return Promise.reject(error);
     }
@@ -156,7 +215,12 @@ http.interceptors.response.use(
       return http(originalRequest);
     } catch (refreshError) {
       clearAuthTokens();
-      message.error("登录已过期，请重新登录");
+      // 复核 P2：并发 401 共享同一个 refreshInFlight，失败时每个请求的
+      // catch 都会走到这里——直接 message.error 会弹 N 个重复 toast，
+      // 走 showErrorToast 的 3 秒同文案去重。
+      showErrorToast("登录已过期，请重新登录");
+      // FE-5：通知认证层（use-auth store）同步登出，避免受保护页面滞留
+      notifyAuthExpired();
       return Promise.reject(refreshError);
     }
   }
@@ -172,24 +236,25 @@ export async function register(credentials: AuthCredentials): Promise<AuthPayloa
   return persistAuthPayload(response.data);
 }
 
-/** 进行中的刷新请求：并发 401 共用同一次刷新，避免重复请求风暴 */
+/** 进行中的刷新请求：并发 401 共用同一次刷新，避免重复请求风暴（FE-1 单飞） */
 let refreshInFlight: Promise<string> | null = null;
 
 export async function refreshAccessToken(): Promise<string> {
-  const refreshToken = getRefreshToken();
-  if (!refreshToken) {
-    throw new Error("Missing refresh token");
-  }
   if (refreshInFlight) {
     return refreshInFlight;
   }
 
   const request = (async () => {
     try {
+      // FE-6：refresh token 由 HttpOnly Cookie 携带；
+      // X-Requested-With 是 cookie 流程的 CSRF 防线
       const response = await http.post<{ access_token: string; token_type: "bearer" }>(
         "/auth/refresh",
-        { refresh_token: refreshToken },
-        { _silent: true } as never
+        null,
+        {
+          headers: { "X-Requested-With": "XMLHttpRequest" },
+          _silent: true
+        }
       );
       setAccessToken(response.data.access_token);
       return response.data.access_token;
@@ -207,14 +272,19 @@ export async function fetchMe(): Promise<PlatformUser> {
 }
 
 export async function bootstrapAuth(): Promise<PlatformUser | null> {
-  if (!getAccessToken() && hasRefreshToken()) {
+  if (!getAccessToken()) {
     try {
+      // FE-6：启动时通过 /auth/refresh 探测会话（HttpOnly Cookie 客户端不可读）
       await refreshAccessToken();
-    } catch {
-      // refresh token 已失效（如超过 7 天）：清理本地凭证并回到登录页，
-      // 不能把异常抛给上层导致应用卡在“正在验证登录状态”
-      clearAuthTokens();
-      return null;
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      if (status === 401 || status === 403) {
+        // 明确的凭证失效：清理并回到登录页
+        clearAuthTokens();
+        return null;
+      }
+      // FE-5：网络异常/5xx 保留 token 并抛给上层允许重试，不销毁登录态
+      throw error;
     }
   }
   if (!getAccessToken()) {
@@ -222,9 +292,14 @@ export async function bootstrapAuth(): Promise<PlatformUser | null> {
   }
   try {
     return await fetchMe();
-  } catch {
-    clearAuthTokens();
-    return null;
+  } catch (error) {
+    const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+    if (status === 401) {
+      clearAuthTokens();
+      notifyAuthExpired();
+      return null;
+    }
+    throw error;
   }
 }
 
@@ -287,8 +362,24 @@ export async function createXhsAnalyticsReport(
 }
 
 export async function fetchAccounts(platform = "xhs"): Promise<PlatformAccount[]> {
-  const response = await http.get<Paginated<PlatformAccount>>("/accounts", { params: { platform } });
-  return response.data.items;
+  // FE-3：分页聚合拉全量——账号下拉必须能选到第 21 个以后的账号
+  const PAGE_SIZE = 100;
+  const first = await http.get<Paginated<PlatformAccount>>("/accounts", {
+    params: { platform, page: 1, page_size: PAGE_SIZE }
+  });
+  const totalPages = Math.ceil(first.data.total / PAGE_SIZE);
+  if (totalPages <= 1) {
+    return [...first.data.items];
+  }
+  // review P2：剩余页并发拉取（此前串行 for-await，账号多时首屏线性变慢）
+  const rest = await Promise.all(
+    Array.from({ length: totalPages - 1 }, (_, index) =>
+      http.get<Paginated<PlatformAccount>>("/accounts", {
+        params: { platform, page: index + 2, page_size: PAGE_SIZE }
+      })
+    )
+  );
+  return [...first.data.items, ...rest.flatMap((response) => response.data.items)];
 }
 
 export type SavedNoteFilters = {
@@ -324,7 +415,7 @@ export async function fetchSavedNotes(platformOrFilters: string | SavedNoteFilte
 }
 
 export async function fetchSavedNote(noteId: number, silent = false): Promise<SavedNote> {
-  const response = await http.get<SavedNote>(`/notes/${noteId}`, { _silent: silent } as never);
+  const response = await http.get<SavedNote>(`/notes/${noteId}`, { _silent: silent });
   return response.data;
 }
 
@@ -438,17 +529,19 @@ export async function crawlXhsDataStream(
   onError?: (message: string) => void,
   signal?: AbortSignal,
 ): Promise<{ total: number; success_count: number; failed_count: number }> {
-  // 支持 AbortSignal 取消；401 时先刷新一次 token 再重试（原生 fetch 不经过 axios 拦截器）
+  // 支持 AbortSignal 取消（FE-11）；cookie 随 withCredentials 自动携带，
+  // 401 时先刷新一次再重试（原生 fetch 不经过 axios 拦截器）
   const doFetch = async (token: string | null) =>
     fetch("/api/xhs/crawl/data", {
       method: "POST",
+      credentials: "include",
       headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: JSON.stringify(payload),
       signal,
     });
 
   let response = await doFetch(getAccessToken());
-  if (response.status === 401 && getRefreshToken()) {
+  if (response.status === 401) {
     try {
       const token = await refreshAccessToken();
       response = await doFetch(token);
@@ -516,8 +609,14 @@ export async function createDraftFromNote(payload: CreateDraftPayload): Promise<
   return response.data;
 }
 
-export async function fetchDrafts(platform = "xhs"): Promise<Paginated<Draft>> {
-  const response = await http.get<Paginated<Draft>>("/drafts", { params: { platform } });
+export async function fetchDrafts(
+  platform = "xhs",
+  pagination: { page?: number; page_size?: number } = {}
+): Promise<Paginated<Draft>> {
+  // FE-3：服务端分页；调用方可显式传 page/page_size
+  const response = await http.get<Paginated<Draft>>("/drafts", {
+    params: { platform, page: pagination.page ?? 1, page_size: pagination.page_size ?? 100 }
+  });
   return response.data;
 }
 
@@ -695,8 +794,12 @@ export async function runDueTasks(platform = "xhs"): Promise<RunDueTasksResponse
   return response.data;
 }
 
-export async function fetchMonitoringTargets(): Promise<Paginated<MonitoringTarget>> {
-  const response = await http.get<Paginated<MonitoringTarget>>("/xhs/monitoring/targets");
+export async function fetchMonitoringTargets(
+  pagination: { page?: number; page_size?: number } = {}
+): Promise<Paginated<MonitoringTarget>> {
+  const response = await http.get<Paginated<MonitoringTarget>>("/xhs/monitoring/targets", {
+    params: { page: pagination.page ?? 1, page_size: pagination.page_size ?? 100 }
+  });
   return response.data;
 }
 
@@ -765,8 +868,13 @@ export async function deleteKeywordGroup(groupId: number): Promise<{ id: number;
   return response.data;
 }
 
-export async function fetchPublishJobs(platform = "xhs"): Promise<Paginated<PublishJob>> {
-  const response = await http.get<Paginated<PublishJob>>("/publish/jobs", { params: { platform } });
+export async function fetchPublishJobs(
+  platform = "xhs",
+  pagination: { page?: number; page_size?: number } = {}
+): Promise<Paginated<PublishJob>> {
+  const response = await http.get<Paginated<PublishJob>>("/publish/jobs", {
+    params: { platform, page: pagination.page ?? 1, page_size: pagination.page_size ?? 100 }
+  });
   return response.data;
 }
 
@@ -886,9 +994,81 @@ export async function confirmXhsPhoneLogin(payload: {
   return response.data;
 }
 
-export async function fetchNotifications(params?: { unread?: boolean; page?: number; page_size?: number }): Promise<Paginated<AppNotification>> {
-  const response = await http.get<Paginated<AppNotification>>("/notifications", { params });
+export async function fetchNotifications(
+  params?: { unread?: boolean; page?: number; page_size?: number },
+  options?: { silent?: boolean }
+): Promise<Paginated<AppNotification>> {
+  // 通知是 30s 轮询：静默失败，否则后端不可用时每 30s 弹一次 toast
+  const response = await http.get<Paginated<AppNotification>>("/notifications", {
+    params,
+    _silent: options?.silent
+  });
   return response.data;
+}
+
+export type NotificationStreamEvent =
+  | { type: "snapshot"; items: AppNotification[] }
+  | { type: "new"; items: AppNotification[] }
+  | { type: "error" };
+
+/**
+ * 订阅通知流（SSE，替代 30s 轮询）。
+ *
+ * 用 fetch + ReadableStream 而不是原生 EventSource：后者无法携带
+ * Authorization 头（access token 只存在内存里）。
+ * 返回的 promise 在连接结束/中断时 resolve；调用方负责重连退避。
+ */
+export async function streamNotifications(
+  onEvent: (event: NotificationStreamEvent) => void,
+  signal: AbortSignal
+): Promise<void> {
+  const token = accessToken;
+  const response = await fetch("/api/notifications/stream", {
+    method: "GET",
+    headers: {
+      Accept: "text/event-stream",
+      ...(token ? { Authorization: `Bearer ${token}` } : {})
+    },
+    credentials: "include",
+    signal
+  });
+  if (response.status === 401) {
+    // 交给统一刷新逻辑：这次重连前先换新 token
+    await refreshAccessToken();
+    throw new Error("unauthorized");
+  }
+  if (!response.ok || !response.body) {
+    throw new Error(`stream failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+        const dataLines = chunk
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart());
+        if (!dataLines.length) continue; // 心跳注释行
+        try {
+          onEvent(JSON.parse(dataLines.join("\n")) as NotificationStreamEvent);
+        } catch {
+          /* 忽略畸形事件，保持连接 */
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export async function markNotificationRead(id: number): Promise<AppNotification> {

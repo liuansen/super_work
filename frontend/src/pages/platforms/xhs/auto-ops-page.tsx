@@ -30,19 +30,20 @@ import {
   Tag,
   Typography,
 } from "antd";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { PageHeader } from "../../../components/layout/app-shell";
 import {
   createAutoTask,
   deleteAutoTask,
-  fetchAccounts,
   fetchAutoTasks,
   runAutoTask,
   updateAutoTask,
+  extractErrorMessage
 } from "../../../lib/api";
 import { formatShanghaiTime } from "../../../lib/time";
-import type { AutoTask, AutoTaskRunResult, PlatformAccount } from "../../../types";
+import { useAccounts } from "../../../hooks/use-accounts";
+import type { AutoTask, AutoTaskRunResult } from "../../../types";
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;
@@ -59,9 +60,9 @@ function getStatusTag(s: string) {
 }
 
 const panelStyle: React.CSSProperties = {
-  background: "#1a1a1a",
+  background: "var(--app-panel-bg)",
   borderRadius: 8,
-  border: "1px solid #303030",
+  border: "1px solid var(--app-border)",
 };
 
 const cardBodyStyle: React.CSSProperties = {
@@ -70,8 +71,16 @@ const cardBodyStyle: React.CSSProperties = {
 
 export function AutoOpsPage() {
   const [tasks, setTasks] = useState<AutoTask[]>([]);
-  const [pcAccounts, setPcAccounts] = useState<PlatformAccount[]>([]);
-  const [creatorAccounts, setCreatorAccounts] = useState<PlatformAccount[]>([]);
+  // 账号列表走共享缓存（同一份数据被 5 个页面复用）
+  const { accounts } = useAccounts("xhs");
+  const pcAccounts = useMemo(
+    () => accounts.filter((a) => a.sub_type === "pc"),
+    [accounts]
+  );
+  const creatorAccounts = useMemo(
+    () => accounts.filter((a) => a.sub_type === "creator"),
+    [accounts]
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -115,13 +124,8 @@ export function AutoOpsPage() {
     setIsLoading(true);
     setError(null);
     try {
-      const [tasksRes, accountsRes] = await Promise.all([
-        fetchAutoTasks(),
-        fetchAccounts("xhs"),
-      ]);
+      const tasksRes = await fetchAutoTasks();
       setTasks(tasksRes.items);
-      setPcAccounts(accountsRes.filter((a) => a.sub_type === "pc"));
-      setCreatorAccounts(accountsRes.filter((a) => a.sub_type === "creator"));
     } catch {
       setError("加载自动运营任务失败。");
     } finally {
@@ -211,8 +215,7 @@ export function AutoOpsPage() {
         `任务"${task.name}"执行完成 -- 关键词: ${result.keyword}, 来源笔记: ${result.source_note.title}, 已创建发布任务 #${result.publish_job.id}。`
       );
     } catch (err: unknown) {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setError(`执行失败：${detail || "请检查账号和模型配置。"}`);
+      setError(`执行失败：${extractErrorMessage(err, "请检查账号和模型配置。")}`);
     } finally {
       setRunningTaskId(null);
     }
@@ -291,13 +294,13 @@ export function AutoOpsPage() {
         <Card style={panelStyle} styles={{ body: cardBodyStyle }}>
           <div style={{ textAlign: "center", padding: 48 }}>
             <Spin size="large" />
-            <Paragraph style={{ color: "#8c8c8c", marginTop: 16 }}>正在加载自动运营任务...</Paragraph>
+            <Paragraph style={{ color: "var(--app-text-tertiary)", marginTop: 16 }}>正在加载自动运营任务...</Paragraph>
           </div>
         </Card>
       ) : tasks.length === 0 && !showCreate ? (
         <Card style={panelStyle} styles={{ body: cardBodyStyle }}>
           <Empty
-            image={<ThunderboltOutlined style={{ fontSize: 48, color: "#8c8c8c" }} />}
+            image={<ThunderboltOutlined style={{ fontSize: 48, color: "var(--app-text-tertiary)" }} />}
             imageStyle={{ height: 64 }}
             description={
               <div>
@@ -316,10 +319,10 @@ export function AutoOpsPage() {
             <Col xs={24} md={12} xl={8} key={task.id}>
               <Card
                 style={panelStyle}
-                styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+                styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
                 title={
                   <Space>
-                    <ThunderboltOutlined style={{ color: task.status === "active" ? "#52c41a" : "#8c8c8c" }} />
+                    <ThunderboltOutlined style={{ color: task.status === "active" ? "#52c41a" : "var(--app-text-tertiary)" }} />
                     <Text ellipsis style={{ maxWidth: 180 }}>
                       {task.name}
                     </Text>
@@ -446,7 +449,7 @@ export function AutoOpsPage() {
             </Space>
           }
           style={panelStyle}
-          styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+          styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
         >
           <Descriptions column={{ xs: 1, md: 2, lg: 4 }} size="small">
             <Descriptions.Item label="关键词">{lastRunResult.keyword}</Descriptions.Item>
@@ -481,7 +484,7 @@ export function AutoOpsPage() {
             </Space>
           }
           style={panelStyle}
-          styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid #303030" } }}
+          styles={{ body: cardBodyStyle, header: { borderBottom: "1px solid var(--app-border)" } }}
           extra={
             <Button type="text" onClick={() => setShowCreate(false)}>
               取消

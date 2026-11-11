@@ -13,13 +13,14 @@ from sqlalchemy.orm.attributes import flag_modified
 from backend.app.core.database import get_db
 from backend.app.core.media_source import (
     InvalidMediaSource,
+    assert_owned_media_name,
     validate_media_file_name,
     validate_media_source,
 )
-from backend.app.core.time import to_naive_shanghai
+from backend.app.core.time import shanghai_now, to_naive_shanghai
 from backend.app.core.deps import get_current_user
 from backend.app.models import AiDraft, DraftAsset, Note, NoteAsset, PlatformAccount, PublishAsset, PublishJob, User
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 
 router = APIRouter(prefix="/drafts", tags=["drafts"])
 
@@ -27,15 +28,16 @@ router = APIRouter(prefix="/drafts", tags=["drafts"])
 class DraftCreateRequest(BaseModel):
     platform: str = Field(pattern="^xhs$")
     source_note_id: Optional[int] = None
-    title: str = ""
-    body: str = ""
+    # AiDraft.title 是 String(256)：SQLite 不强制长度，切 MySQL/PG 后超长会 500
+    title: str = Field(default="", max_length=256)
+    body: str = Field(default="", max_length=100_000)
     intent: str = Field(default="publish", max_length=32)
 
 
 class DraftUpdateRequest(BaseModel):
-    title: Optional[str] = None
-    body: Optional[str] = None
-    tags: Optional[list[dict]] = None
+    title: Optional[str] = Field(default=None, max_length=256)
+    body: Optional[str] = Field(default=None, max_length=100_000)
+    tags: Optional[list[dict]] = Field(default=None, max_length=64)
 
 
 class DraftSendToPublishRequest(BaseModel):
@@ -128,8 +130,15 @@ def get_drafts(
     statement = select(AiDraft).where(AiDraft.user_id == current_user.id)
     if platform:
         statement = statement.where(AiDraft.platform == platform)
-    drafts = db.scalars(statement.order_by(AiDraft.created_at.desc())).all()
-    return paginated([_serialize_draft(draft) for draft in drafts], page, page_size)
+    # PERF-2：SQL 侧分页，不再全量加载后内存切片
+    return paginate_query(
+        db,
+        statement,
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_draft,
+        order_by=(AiDraft.created_at.desc(), AiDraft.id.desc()),
+    )
 
 
 @router.post("")
@@ -163,11 +172,14 @@ def create_draft(
                 elif isinstance(t, dict) and t.get("name"):
                     tags.append({"id": str(t.get("id", "")), "name": str(t["name"])})
 
+    # 区分“未提供”与“显式传空串”：用户传 "" 是想清空标题/正文，
+    # 早期用 `payload.title or source.title` 会把空串又覆盖回源笔记内容。
+    provided = payload.model_fields_set
     draft = AiDraft(
         user_id=current_user.id,
         platform=payload.platform,
-        title=payload.title or (source_note.title if source_note else ""),
-        body=payload.body or (source_note.content if source_note else ""),
+        title=payload.title if "title" in provided else (source_note.title if source_note else ""),
+        body=payload.body if "body" in provided else (source_note.content if source_note else ""),
         tags=tags,
         source_note_id=source_note.id if source_note else None,
     )
@@ -208,7 +220,22 @@ def send_draft_to_publish(
         account = db.get(PlatformAccount, payload.platform_account_id)
         if account is None or account.user_id != current_user.id or account.platform != draft.platform:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Platform account not found")
+        # 说明：草稿送发布允许先绑定任意平台账号（发布中心可再改绑），
+        # 实际执行前才要求 Creator 子类型（见 publish.py 改绑校验与执行器校验）
         account_id = account.id
+
+    # SCH-6：scheduled 模式必须有未来的时间，否则任务永远滞留 pending
+    if payload.publish_mode == "scheduled":
+        if payload.scheduled_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="scheduled 发布模式必须提供 scheduled_at",
+            )
+        if payload.scheduled_at <= shanghai_now():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="scheduled_at 必须晚于当前时间",
+            )
 
     options = _build_publish_options(payload)
     if draft.tags:
@@ -283,7 +310,6 @@ def delete_draft(
     draft = db.get(AiDraft, draft_id)
     if draft is None or draft.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found")
-    db.execute(select(DraftAsset).where(DraftAsset.draft_id == draft.id))
     for asset in db.scalars(select(DraftAsset).where(DraftAsset.draft_id == draft.id)).all():
         db.delete(asset)
     db.delete(draft)
@@ -305,6 +331,15 @@ def _serialize_draft_asset(asset: DraftAsset) -> dict:
         "local_path": asset.local_path,
         "sort_order": asset.sort_order,
     }
+
+
+def _validate_asset_ownership(local_path: str, user_id: int) -> None:
+    """草稿素材来源归属校验：local_path 必须属于当前用户（url 允许外部白名单域名）。"""
+    if local_path and local_path.strip():
+        try:
+            assert_owned_media_name(local_path, user_id)
+        except InvalidMediaSource as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class DraftAssetCreateRequest(BaseModel):
@@ -362,6 +397,8 @@ def add_draft_asset(
     draft = db.get(AiDraft, draft_id)
     if draft is None or draft.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="Draft not found")
+    # 本地媒体名必须属于当前用户（防跨用户引用）；URL 走白名单校验
+    _validate_asset_ownership(payload.local_path, current_user.id)
     max_order = db.scalar(select(func.max(DraftAsset.sort_order)).where(DraftAsset.draft_id == draft.id)) or 0
     asset = DraftAsset(
         draft_id=draft.id,
@@ -436,6 +473,7 @@ def update_draft_asset(
     if payload.url is not None:
         asset.url = payload.url
     if payload.local_path is not None:
+        _validate_asset_ownership(payload.local_path, current_user.id)
         asset.local_path = payload.local_path
     db.commit()
     db.refresh(asset)

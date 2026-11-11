@@ -62,28 +62,33 @@ def _sign_token(payload: dict) -> str:
     return f"{signing_input}.{_base64url_encode(signature)}"
 
 
-def _create_token(user_id: int, expires_delta: timedelta, token_type: str) -> str:
+def _create_token(user_id: int, expires_delta: timedelta, token_type: str, token_version: int = 0) -> str:
     expires_at = datetime.now(timezone.utc) + expires_delta
-    payload = {"user_id": user_id, "token_type": token_type, "exp": int(expires_at.timestamp())}
+    payload = {
+        "user_id": user_id,
+        "token_type": token_type,
+        "ver": int(token_version or 0),
+        "exp": int(expires_at.timestamp()),
+    }
     return _sign_token(payload)
 
 
-def create_access_token(user_id: int) -> str:
-    return _create_token(user_id, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES), "access")
+def create_access_token(user_id: int, token_version: int = 0) -> str:
+    return _create_token(user_id, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES), "access", token_version)
 
 
-def create_refresh_token(user_id: int) -> str:
-    return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "refresh")
+def create_refresh_token(user_id: int, token_version: int = 0) -> str:
+    return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "refresh", token_version)
 
 
-def create_media_token(user_id: int) -> str:
+def create_media_token(user_id: int, token_version: int = 0) -> str:
     """媒体文件读取专用 token。
 
     前端 ``<img>`` 标签无法携带 Authorization 头，登录/刷新时通过
     HttpOnly cookie 下发该 token，用于 ``GET /api/files/media/`` 鉴权。
     有效期与 refresh token 对齐。
     """
-    return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "media")
+    return _create_token(user_id, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS), "media", token_version)
 
 
 def decode_token(token: str) -> dict:

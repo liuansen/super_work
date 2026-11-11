@@ -27,4 +27,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             detail="User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    # review P2：令牌版本校验（logout-all / 凭证泄露后立即失效，
+    # 而不是只能等 7 天自然过期）
+    if int(payload.get("ver") or 0) != int(user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user

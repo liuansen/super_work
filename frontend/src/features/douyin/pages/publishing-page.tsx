@@ -75,12 +75,14 @@ export function DouyinPublishingPage() {
   }, []);
 
   useEffect(() => {
-    void load();
-    void fetchDouyinAccounts().then((list) => {
-      setAccounts(list);
-      const active = list.find((a) => a.status === "active");
-      if (active) form.setFieldValue("account_id", active.id);
-    });
+    void load().catch(() => {/* 失败提示已由统一拦截器处理 */});
+    void fetchDouyinAccounts()
+      .then((list) => {
+        setAccounts(list);
+        const active = list.find((a) => a.status === "active");
+        if (active) form.setFieldValue("account_id", active.id);
+      })
+      .catch(() => {/* 失败提示已由统一拦截器处理 */});
   }, [load, form]);
 
   const activeAccounts = accounts.filter((a) => a.status === "active");
@@ -238,7 +240,7 @@ export function DouyinPublishingPage() {
                 description={
                   <>
                     <Paragraph type="secondary" style={{ marginBottom: 4 }}>
-                      账号 {task.account_id} · 可见性{" "}
+                      账号 {accounts.find((a) => a.id === task.account_id)?.nickname || task.account_id} · 可见性{" "}
                       {task.visibility === 0 ? "公开" : task.visibility === 1 ? "仅自己" : "好友"} ·
                       {task.allow_download ? " 允许下载" : " 不允许下载"}
                     </Paragraph>

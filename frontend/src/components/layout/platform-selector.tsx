@@ -21,7 +21,7 @@ export function PlatformSelector({ platforms }: { platforms: PlatformMeta[] }) {
             <Card
               hoverable
               style={{
-                borderColor: "#303030",
+                borderColor: "var(--app-border)",
                 cursor: "pointer",
               }}
               styles={{
@@ -81,11 +81,11 @@ export function PlatformSelector({ platforms }: { platforms: PlatformMeta[] }) {
                   </Tag>
                   {platform.enabled ? (
                     <ArrowRightOutlined
-                      style={{ color: "rgba(255,255,255,0.45)", fontSize: 14 }}
+                      style={{ color: "var(--app-text-tertiary-weak)", fontSize: 14 }}
                     />
                   ) : (
                     <ClockCircleOutlined
-                      style={{ color: "rgba(255,255,255,0.25)", fontSize: 14 }}
+                      style={{ color: "var(--app-text-disabled)", fontSize: 14 }}
                     />
                   )}
                 </div>

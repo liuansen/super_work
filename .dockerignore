@@ -13,13 +13,19 @@ __pycache__
 *.egg-info
 .pytest_cache
 
-# Environment and secrets
+# Environment and secrets（INF-2：覆盖所有 .env 变体，防止密钥进镜像）
 .env
-*.env.local
-*.env.*.local
+.env.*
+frontend/.env
+frontend/.env.*
+**/.env
+**/.env.*
+!.env.example
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 data/
 
 # Storage artifacts (mounted as volumes)
@@ -49,5 +55,19 @@ Thumbs.db
 
 # Test artifacts
 tests/
+frontend/e2e/
+frontend/playwright.config.ts
+frontend/test-results/
+frontend/playwright-report/
 htmlcov/
 .coverage
+
+# 本地工作区快照与校验产物（INF-2）
+.local/
+.workbench-verification/
+docs/
+scripts/rotate_secrets.py
+
+# Git worktree 元数据
+.celeste
+.worktrees

@@ -55,12 +55,14 @@ export function DouyinWorksPage() {
   }, []);
 
   useEffect(() => {
-    void load();
-    void fetchDouyinAccounts().then((list) => {
-      setAccounts(list);
-      const active = list.find((a) => a.status === "active");
-      if (active) setAccountId(active.id);
-    });
+    void load().catch(() => {/* 失败提示已由统一拦截器处理 */});
+    void fetchDouyinAccounts()
+      .then((list) => {
+        setAccounts(list);
+        const active = list.find((a) => a.status === "active");
+        if (active) setAccountId(active.id);
+      })
+      .catch(() => {/* 失败提示已由统一拦截器处理 */});
   }, [load]);
 
   const refreshOne = async (row: DouyinReference) => {

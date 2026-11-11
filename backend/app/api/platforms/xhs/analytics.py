@@ -85,15 +85,10 @@ def _owned_notes(db: Session, current_user: User) -> list[Note]:
 
 
 def _note_haystack(note: Note) -> str:
-    return "\n".join(
-        [
-            note.note_id or "",
-            note.title or "",
-            note.content or "",
-            note.author_name or "",
-            str(note.raw_json or {}),
-        ]
-    ).lower()
+    # 统一实现见 services/note_search：读取写入时算好的 search_text
+    from backend.app.services.note_search import note_haystack
+
+    return note_haystack(note)
 
 
 def _note_matches_value(note: Note, value: str) -> bool:
@@ -273,12 +268,16 @@ def _keyword_trend_items(db: Session, current_user: User, notes: list[Note]) -> 
 
     items: list[dict[str, Any]] = []
     if groups:
+        # 每条笔记的 haystack 只构建一次：此前是 O(关键词数 × 笔记数) 次
+        # json.dumps(raw_json)，raw_json 是完整上游响应（几十 KB/条）
+        haystacks = {note.id: _note_haystack(note) for note in notes}
         for group in groups:
             for keyword in group.keywords or []:
                 keyword_text = str(keyword).strip()
                 if not keyword_text:
                     continue
-                matched = [note for note in notes if _note_matches_value(note, keyword_text)]
+                needle = keyword_text.lower()
+                matched = [note for note in notes if needle in haystacks.get(note.id, "")]
                 engagement = sum(_note_metrics(note)["engagement"] for note in matched)
                 items.append(
                     {
@@ -478,7 +477,6 @@ def create_report(
         "generated_at": generated_at.isoformat(),
         "note_count": len(notes),
         "file_name": file_name,
-        "file_path": str(file_path),
         "download_url": f"/api/files/exports/{file_name}",
         "summary": report_payload["summary"],
     }

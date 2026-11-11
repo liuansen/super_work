@@ -24,7 +24,8 @@
 #   frontend.build_dir   -> FRONTEND_BUILD_DIR
 
 server:
-  host: "0.0.0.0"
+  # INF-4：本地开发默认只绑回环地址；容器/生产通过 --host 或 SERVER_HOST 显式开放
+  host: "127.0.0.1"
   port: 8000
   cors_origins: "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173"
 
@@ -41,11 +42,27 @@ database:
   mysql_database: "spider_xhs"
 
 security:
-  # JWT signing key - MUST be changed in production
-  secret_key: "dev-only-change-me"
+  # JWT signing key - DO NOT put a real key here.
+  # Leave empty: development generates an in-process random key with a warning;
+  # production MUST provide SECRET_KEY via environment variable, otherwise
+  # startup is rejected (backend/app/core/config.py::assert_runtime_safety).
+  secret_key: ""
   # Fernet key for encrypting cookies and API keys
   # If empty, auto-derived from secret_key via SHA-256 + base64
   fernet_key: ""
+
+rate_limit:
+  # 设置后登录限流与抓取限速改为 Redis 共享计数（多 worker/多副本必需）
+  # 留空 = 进程内存实现（单进程开发场景）
+  redis_url: ""
+  # 每账号每分钟最大抓取次数（0 = 停止抓取）
+  crawl_per_minute: 5
+
+backup:
+  # SQLite 在线备份（VACUUM INTO，每 24h 一次）；非 SQLite 后端自动跳过
+  enabled: true
+  dir: "./data/backups"
+  keep: 7
 
 scheduler:
   # Enable background task scheduler (publish jobs, monitoring refresh)

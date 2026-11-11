@@ -12,21 +12,24 @@ from backend.app.core.deps import get_current_user
 from backend.app.core.net_guard import public_http_url_error
 from backend.app.core.security import encrypt_text
 from backend.app.models import DEFAULT_TEXT_MODEL_NAME, ModelConfig, User
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 
 router = APIRouter(prefix="/model-configs", tags=["model-configs"])
 
 
-def _ssrf_guard(base_url: str) -> Optional[str]:
+def _ssrf_guard(base_url: str, *, resolve_dns: bool = True) -> Optional[str]:
     """base_url 由用户自由填写，测试连接前确认目标地址合法。
 
     无条件封禁链路本地（云元数据）/保留段；多租户部署可通过
     allow_private_model_endpoints=False 同时封禁环回与私网。
+    保存时（resolve_dns=False）只做协议/字面 IP 校验——完整 DNS 校验
+    在真正发起请求时执行（存在 TOCTOU，不能只靠保存时检查）。
     """
     from backend.app.core.config import get_settings
 
     return public_http_url_error(
         base_url,
+        resolve_dns=resolve_dns,
         block_private=not getattr(get_settings(), "allow_private_model_endpoints", True),
     )
 
@@ -46,7 +49,9 @@ class ModelConfigUpdateRequest(BaseModel):
     provider: Optional[str] = Field(default=None, min_length=1, max_length=64)
     model_name: Optional[str] = Field(default=None, max_length=128)
     base_url: Optional[str] = None
+    # 空串 = 不修改（前端编辑表单留空即保持原 Key）；显式清空用 clear_api_key
     api_key: Optional[str] = None
+    clear_api_key: bool = False
     is_default: Optional[bool] = None
 
 
@@ -100,8 +105,15 @@ def get_model_configs(
     statement = select(ModelConfig).where(ModelConfig.user_id == current_user.id)
     if model_type:
         statement = statement.where(ModelConfig.model_type == model_type)
-    configs = db.scalars(statement.order_by(ModelConfig.id.desc())).all()
-    return paginated([_serialize_config(config) for config in configs], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        statement,
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_config,
+        order_by=ModelConfig.id.desc(),
+    )
 
 
 @router.post("")
@@ -110,6 +122,11 @@ def create_model_config(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if payload.base_url:
+        # 保存时即校验出站地址（SEC-5）：避免通过 AI 调用形成 SSRF
+        guard_message = _ssrf_guard(payload.base_url, resolve_dns=False)
+        if guard_message:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=guard_message)
     if payload.is_default:
         _clear_default_for_type(db, current_user.id, payload.model_type)
 
@@ -154,12 +171,15 @@ def test_model_config(
     try:
         import requests as http_requests
 
+        # allow_redirects=False（SEC-5）：重定向目标会收到 Authorization 头，
+        # 自动跟随可能把用户 API Key 泄露给任意第三方主机。
         if config.model_type == "image":
             resp = http_requests.post(
                 f"{base_url}/images/generations",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"model": config.model_name, "prompt": "test", "n": 1, "size": "256x256"},
                 timeout=15,
+                allow_redirects=False,
             )
         else:
             resp = http_requests.post(
@@ -167,18 +187,22 @@ def test_model_config(
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json={"model": config.model_name, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5},
                 timeout=15,
+                allow_redirects=False,
             )
 
+        # 不回显原始响应体（SEC-5）：响应内容可能包含内网服务指纹
         if resp.status_code < 400:
             try:
                 body = resp.json()
                 if body.get("choices") or body.get("data") or body.get("object"):
                     return {"id": config.id, "status": "ok", "message": f"连接成功 ({resp.status_code})"}
-                return {"id": config.id, "status": "error", "message": f"响应格式异常: {resp.text[:150]}"}
+                return {"id": config.id, "status": "error", "message": f"响应格式异常 (HTTP {resp.status_code})"}
             except Exception:
-                return {"id": config.id, "status": "error", "message": f"响应非 JSON: {resp.text[:150]}"}
+                return {"id": config.id, "status": "error", "message": f"响应非 JSON (HTTP {resp.status_code})"}
+        elif resp.status_code in (301, 302, 303, 307, 308):
+            return {"id": config.id, "status": "error", "message": f"端点返回重定向 (HTTP {resp.status_code})，请直接填写最终地址"}
         else:
-            return {"id": config.id, "status": "error", "message": f"HTTP {resp.status_code}: {resp.text[:150]}"}
+            return {"id": config.id, "status": "error", "message": f"HTTP {resp.status_code}"}
     except Exception as exc:
         return {"id": config.id, "status": "error", "message": str(exc)[:200]}
 
@@ -199,9 +223,17 @@ def update_model_config(
     if payload.model_name is not None:
         config.model_name = _normalize_model_name(config.model_type, payload.model_name)
     if payload.base_url is not None:
+        # 保存时即校验出站地址（SEC-5）
+        if payload.base_url:
+            guard_message = _ssrf_guard(payload.base_url, resolve_dns=False)
+            if guard_message:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=guard_message)
         config.base_url = payload.base_url
-    if payload.api_key is not None:
-        config.encrypted_api_key = encrypt_text(payload.api_key) if payload.api_key else ""
+    # FE-2/P0-8：空串按“不修改”处理，避免编辑表单留空时静默清空已保存的 Key
+    if payload.clear_api_key:
+        config.encrypted_api_key = ""
+    elif payload.api_key:
+        config.encrypted_api_key = encrypt_text(payload.api_key)
     if payload.is_default is not None:
         if payload.is_default:
             _clear_default_for_type(db, current_user.id, config.model_type)

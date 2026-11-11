@@ -205,14 +205,14 @@ export function XhsAnalyticsPage() {
             <Card
               size="small"
               style={{
-                background: "#1f1f1f",
-                borderColor: "#303030",
+                background: "var(--app-surface-alt)",
+                borderColor: "var(--app-border)",
                 borderTop: `2px solid ${metricIconColors[idx]}`,
               }}
             >
               <Statistic
                 title={
-                  <span style={{ color: "#8c8c8c", fontSize: 13 }}>{metric.label}</span>
+                  <span style={{ color: "var(--app-text-tertiary)", fontSize: 13 }}>{metric.label}</span>
                 }
                 value={metric.value}
                 prefix={
@@ -264,7 +264,7 @@ export function XhsAnalyticsPage() {
                   </Space>
                 }
                 extra={<Link to="/platforms/xhs/library">进入内容库</Link>}
-                style={{ background: "#1f1f1f", borderColor: "#303030", height: "100%" }}
+                style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)", height: "100%" }}
                 styles={{ body: { padding: "12px 16px" } }}
               >
                 <Table<AnalyticsTopContent>
@@ -292,7 +292,7 @@ export function XhsAnalyticsPage() {
                   extra={
                     <Tag color="blue">{hotTopics.length} 个</Tag>
                   }
-                  style={{ background: "#1f1f1f", borderColor: "#303030", flex: 1 }}
+                  style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)", flex: 1 }}
                   styles={{ body: { padding: "8px 16px", maxHeight: 320, overflowY: "auto" } }}
                 >
                   {hotTopics.length === 0 ? (
@@ -316,7 +316,7 @@ export function XhsAnalyticsPage() {
                                 percent={pct}
                                 showInfo={false}
                                 strokeColor="#1668dc"
-                                trailColor="#303030"
+                                trailColor="var(--app-border)"
                                 size="small"
                               />
                             </div>
@@ -340,7 +340,7 @@ export function XhsAnalyticsPage() {
                       {commentInsights.question_count} 个提问
                     </Text>
                   }
-                  style={{ background: "#1f1f1f", borderColor: "#303030" }}
+                  style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)" }}
                   styles={{ body: { padding: "12px 16px" } }}
                 >
                   {commentInsights.top_terms.length === 0 ? (
@@ -373,7 +373,7 @@ export function XhsAnalyticsPage() {
             </Col>
           </Row>
 
-          <Divider style={{ borderColor: "#303030", margin: "24px 0" }} />
+          <Divider style={{ borderColor: "var(--app-border)", margin: "24px 0" }} />
 
           {/* ---- Bottom: Top Comments ---- */}
           <Card
@@ -386,7 +386,7 @@ export function XhsAnalyticsPage() {
             extra={
               <Tag>{commentInsights.top_comments.length} 条</Tag>
             }
-            style={{ background: "#1f1f1f", borderColor: "#303030" }}
+            style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)" }}
             styles={{ body: { padding: "8px 16px" } }}
           >
             <List
@@ -394,13 +394,13 @@ export function XhsAnalyticsPage() {
               locale={{ emptyText: "暂无已保存评论。" }}
               split={false}
               renderItem={(comment) => (
-                <List.Item style={{ padding: "10px 0", borderBottom: "1px solid #262626" }}>
+                <List.Item style={{ padding: "10px 0", borderBottom: "1px solid var(--app-elevated)" }}>
                   <List.Item.Meta
                     avatar={
                       <Avatar
                         size={36}
                         icon={<UserOutlined />}
-                        style={{ backgroundColor: "#303030" }}
+                        style={{ backgroundColor: "var(--app-border)" }}
                       />
                     }
                     title={

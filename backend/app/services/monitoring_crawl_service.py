@@ -6,13 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from backend.app.adapters.xhs.pc_api_adapter import XhsPcApiAdapter
-from backend.app.api.platforms.xhs.crawl import (
-    _data_items,
-    _save_normalized_notes,
-)
-from backend.app.api.platforms.xhs.pc import (
-    _normalize_detail_payload,
-    _normalize_search_item,
+from backend.app.api.platforms.xhs.pc import _normalize_detail_payload
+from backend.app.services.note_ingest import save_normalized_notes as _save_normalized_notes
+from backend.app.services.xhs_normalizers import (
+    data_items as _data_items,
+    normalize_search_item as _normalize_search_item,
 )
 from backend.app.core.time import shanghai_now
 from backend.app.models import (
@@ -44,6 +42,7 @@ def _find_pc_account(db: Session, target: MonitoringTarget, user: User) -> Platf
 
 def _decrypt_cookies(db: Session, account: PlatformAccount) -> str | None:
     from backend.app.core.security import decrypt_text
+    from backend.app.services.account_service import cookie_header_from_text
 
     version = db.scalars(
         select(AccountCookieVersion)
@@ -53,15 +52,8 @@ def _decrypt_cookies(db: Session, account: PlatformAccount) -> str | None:
     ).first()
     if not version:
         return None
-    raw = decrypt_text(version.encrypted_cookies)
-    try:
-        import json
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return "; ".join(f"{k}={v}" for k, v in parsed.items())
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return raw
+    # 统一走 account_service：JSON dict ↔ k=v; 串 的解析只保留一份实现
+    return cookie_header_from_text(decrypt_text(version.encrypted_cookies))
 
 
 def _classify_error(exc: Exception) -> str:
@@ -113,15 +105,12 @@ def _note_engagement(note: Note) -> int:
 
 
 def _make_snapshot(db: Session, target: MonitoringTarget, user: User) -> MonitoringSnapshot:
-    notes = db.scalars(
-        select(Note)
-        .where(Note.user_id == user.id, Note.platform == "xhs")
-        .order_by(Note.created_at.desc())
-    ).all()
+    # PERF-1 同步：复用调度器的「SQL 预过滤 + Python 精筛 + 上限」实现，
+    # 不再把该用户全部笔记载入内存逐条 json.dumps 匹配。
+    from backend.app.api.platforms.xhs.monitoring import _serialize_monitoring_note
+    from backend.app.services.scheduler_service import _matching_notes_for_target
 
-    from backend.app.api.platforms.xhs.monitoring import _note_matches_target, _serialize_monitoring_note
-    matched = [n for n in notes if _note_matches_target(n, target)]
-    matched.sort(key=_note_engagement, reverse=True)
+    matched = _matching_notes_for_target(db, target, "xhs")
 
     payload = {
         "matched_count": len(matched),

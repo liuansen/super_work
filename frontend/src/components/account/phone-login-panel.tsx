@@ -98,15 +98,15 @@ export function PhoneLoginPanel({ accountType, onConfirmed }: PhoneLoginPanelPro
 
   return (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-      <Text style={{ color: "rgba(255,255,255,0.65)" }}>{statusText}</Text>
+      <Text style={{ color: "var(--app-text-secondary)" }}>{statusText}</Text>
 
       <Form layout="vertical">
-        <Form.Item label={<span style={{ color: "rgba(255,255,255,0.88)" }}>手机号</span>}>
+        <Form.Item label={<span style={{ color: "var(--app-text)" }}>手机号</span>}>
           <Input
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
             placeholder="请输入手机号"
-            style={{ background: "#1f1f1f", borderColor: "#303030", color: "rgba(255,255,255,0.88)" }}
+            style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)", color: "var(--app-text)" }}
           />
         </Form.Item>
       </Form>
@@ -115,7 +115,7 @@ export function PhoneLoginPanel({ accountType, onConfirmed }: PhoneLoginPanelPro
         <Checkbox
           checked={syncCreator}
           onChange={(event) => setSyncCreator(event.target.checked)}
-          style={{ color: "rgba(255,255,255,0.88)" }}
+          style={{ color: "var(--app-text)" }}
         >
           登录 PC 后同步 Creator 账号
         </Checkbox>
@@ -132,12 +132,12 @@ export function PhoneLoginPanel({ accountType, onConfirmed }: PhoneLoginPanelPro
       </Button>
 
       <Form layout="vertical">
-        <Form.Item label={<span style={{ color: "rgba(255,255,255,0.88)" }}>验证码</span>}>
+        <Form.Item label={<span style={{ color: "var(--app-text)" }}>验证码</span>}>
           <Input
             value={code}
             onChange={(e) => setCode(e.target.value)}
             placeholder="请输入验证码"
-            style={{ background: "#1f1f1f", borderColor: "#303030", color: "rgba(255,255,255,0.88)" }}
+            style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)", color: "var(--app-text)" }}
           />
         </Form.Item>
       </Form>

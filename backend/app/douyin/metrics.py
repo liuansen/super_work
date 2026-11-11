@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from backend.app.core.time import shanghai_now
@@ -17,6 +17,11 @@ from backend.app.douyin import accounts as accounts_service
 from backend.app.douyin import references as references_service
 from backend.app.douyin.contracts import DouyinAdapter, WorkStats
 from backend.app.douyin.models import DouyinAccount, DouyinMetricSnapshot, DouyinReferenceWork
+
+
+# review P3：每个参考作品保留最近 N 条快照（monitoring 快照已有同类策略）。
+# 每次 refresh 会为每个作品写一行，长期运行后该表无限增长。
+SNAPSHOT_KEEP_PER_REFERENCE = 100
 
 
 def _insert_snapshot(
@@ -35,6 +40,21 @@ def _insert_snapshot(
     )
     db.add(row)
     return row
+
+
+def _prune_snapshots(db: Session, reference_id: int, keep: int = SNAPSHOT_KEEP_PER_REFERENCE) -> int:
+    """每个参考作品只保留最近 keep 条快照，防止表无限增长。"""
+    stale_ids = db.scalars(
+        select(DouyinMetricSnapshot.id)
+        .where(DouyinMetricSnapshot.reference_work_id == reference_id)
+        .order_by(DouyinMetricSnapshot.id.desc())
+        .offset(keep)
+        .limit(500)
+    ).all()
+    if stale_ids:
+        db.execute(delete(DouyinMetricSnapshot).where(DouyinMetricSnapshot.id.in_(stale_ids)))
+    return len(stale_ids)
+
 
 
 def refresh_reference(
@@ -59,6 +79,8 @@ def refresh_reference(
             collect_count=snapshot.stats.collect_count,
         ),
     )
+    db.flush()
+    _prune_snapshots(db, stored.id)
     db.commit()
     db.refresh(row)
     return row
@@ -82,6 +104,9 @@ def refresh_account_works(
             db, user_id, item, account.id, commit=False
         )
         created.append(_insert_snapshot(db, user_id, reference.id, item.stats))
+    db.flush()
+    for reference_id in {row.reference_work_id for row in created}:
+        _prune_snapshots(db, reference_id)
     db.commit()
     return created
 

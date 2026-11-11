@@ -230,7 +230,7 @@ export function XhsMonitoringPage() {
       />
 
       <Card
-        style={{ background: "#1f1f1f", borderColor: "#303030", marginBottom: 24 }}
+        style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)", marginBottom: 24 }}
       >
         <Form layout="inline" style={{ flexWrap: "wrap", gap: 8 }}>
           <Form.Item>
@@ -299,7 +299,7 @@ export function XhsMonitoringPage() {
           <Spin tip="正在加载监控目标..." />
         </div>
       ) : targets.length === 0 ? (
-        <Card style={{ background: "#1f1f1f", borderColor: "#303030" }}>
+        <Card style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)" }}>
           <Empty description="暂无监控目标。" />
         </Card>
       ) : (
@@ -315,7 +315,7 @@ export function XhsMonitoringPage() {
                     </Tag>
                   </Space>
                 }
-                style={{ background: "#1f1f1f", borderColor: "#303030" }}
+                style={{ background: "var(--app-surface-alt)", borderColor: "var(--app-border)" }}
               >
                 <Text type="secondary" style={{ display: "block", marginBottom: 8 }}>
                   {target.value}

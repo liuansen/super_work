@@ -1,3 +1,4 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App, ConfigProvider, theme } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { createContext, useContext, useEffect, useState } from "react";
@@ -50,6 +51,19 @@ const lightComponents = {
   Table: {},
 };
 
+// 服务端状态缓存：账号/通知等高频共享数据的 staleTime 内不重复请求。
+// retry 保持 1 次（后端不可用时别放大轮询压力），窗口聚焦不自动重取，
+// 避免长时间后台后切回来同时打出一串请求。
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      retry: 1,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
+
 type AppProvidersProps = { children: ReactNode };
 
 export function AppProviders({ children }: AppProvidersProps) {
@@ -60,6 +74,7 @@ export function AppProviders({ children }: AppProvidersProps) {
 
   useEffect(() => {
     localStorage.setItem("theme-mode", mode);
+    document.documentElement.dataset.theme = mode;
     document.body.style.background = mode === "dark" ? "#141414" : "#f5f5f5";
   }, [mode]);
 
@@ -67,17 +82,19 @@ export function AppProviders({ children }: AppProvidersProps) {
   const isDark = mode === "dark";
 
   return (
-    <ThemeContext.Provider value={{ mode, toggle }}>
-      <ConfigProvider
-        locale={zhCN}
-        theme={{
-          algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
-          token: isDark ? darkTokens : lightTokens,
-          components: isDark ? darkComponents : lightComponents,
-        }}
-      >
-        <App>{children}</App>
-      </ConfigProvider>
-    </ThemeContext.Provider>
+    <QueryClientProvider client={queryClient}>
+      <ThemeContext.Provider value={{ mode, toggle }}>
+        <ConfigProvider
+          locale={zhCN}
+          theme={{
+            algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
+            token: isDark ? darkTokens : lightTokens,
+            components: isDark ? darkComponents : lightComponents,
+          }}
+        >
+          <App>{children}</App>
+        </ConfigProvider>
+      </ThemeContext.Provider>
+    </QueryClientProvider>
   );
 }

@@ -16,7 +16,6 @@ import {
   Row,
   Segmented,
   Space,
-  Statistic,
   Typography,
 } from "antd";
 import { type FormEvent, useState } from "react";
@@ -57,6 +56,8 @@ export function LoginPage() {
 
   async function handleSubmit(event?: FormEvent<HTMLFormElement>) {
     if (event) event.preventDefault();
+    // FE-17：重复提交（回车连按）不再发起第二次请求
+    if (isSubmitting) return;
     setError(null);
 
     const parsed = credentialsSchema.safeParse({ username, password });
@@ -77,6 +78,8 @@ export function LoginPage() {
       } else {
         await auth.register(parsed.data);
       }
+      // 产品约定（tests/workbench.test.cjs）：新会话统一先落到应用中心，
+      // 不沿用登录前被拦截的业务深链
       navigate('/apps', { replace: true });
     } catch (caughtError) {
       setError(
@@ -96,7 +99,7 @@ export function LoginPage() {
     <div
       style={{
         minHeight: "100vh",
-        background: "#0a0a0a",
+        background: "var(--app-bg-deep)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -149,7 +152,7 @@ export function LoginPage() {
           <Title
             level={2}
             style={{
-              color: "#fff",
+              color: "var(--app-text)",
               marginBottom: 12,
               lineHeight: 1.4,
             }}
@@ -165,52 +168,30 @@ export function LoginPage() {
             发布统一在一个工作区里完成。
           </Paragraph>
 
-          <Row gutter={24}>
-            <Col span={8}>
-              <Statistic
-                title={
-                  <Space size={4}>
-                    <DatabaseOutlined />
-                    <span>今日抓取</span>
-                  </Space>
-                }
-                value={128}
-                valueStyle={{ color: "#fff", fontSize: 28 }}
-              />
-            </Col>
-            <Col span={8}>
-              <Statistic
-                title={
-                  <Space size={4}>
-                    <RobotOutlined />
-                    <span>AI 草稿</span>
-                  </Space>
-                }
-                value={14}
-                valueStyle={{ color: "#fff", fontSize: 28 }}
-              />
-            </Col>
-            <Col span={8}>
-              <Statistic
-                title={
-                  <Space size={4}>
-                    <RadarChartOutlined />
-                    <span>待发布</span>
-                  </Space>
-                }
-                value={7}
-                valueStyle={{ color: "#fff", fontSize: 28 }}
-              />
-            </Col>
-          </Row>
+          {/* 原为写死的“今日抓取 128 / AI 草稿 14 / 待发布 7”假指标，
+              与“绝不伪造数字”的项目原则冲突，改为定性能力说明 */}
+          <Space size={20} wrap>
+            <Space size={6}>
+              <DatabaseOutlined />
+              <Text type="secondary">笔记采集</Text>
+            </Space>
+            <Space size={6}>
+              <RobotOutlined />
+              <Text type="secondary">AI 改写</Text>
+            </Space>
+            <Space size={6}>
+              <RadarChartOutlined />
+              <Text type="secondary">定时发布</Text>
+            </Space>
+          </Space>
         </Col>
 
         {/* Right side: login form */}
         <Col xs={24} md={12}>
           <Card
             style={{
-              background: "#1a1a1a",
-              borderColor: "#303030",
+              background: "var(--app-panel-bg)",
+              borderColor: "var(--app-border)",
               borderRadius: 12,
             }}
             styles={{
@@ -223,7 +204,7 @@ export function LoginPage() {
               style={{ marginBottom: 20 }}
             >
               <LockOutlined
-                style={{ fontSize: 16, color: "rgba(255,255,255,0.65)" }}
+                style={{ fontSize: 16, color: "var(--app-text-secondary)" }}
               />
               <Text strong style={{ fontSize: 15 }}>
                 {mode === "login" ? "平台登录" : "注册平台账号"}

@@ -22,7 +22,7 @@ export function PlatformSelectPage() {
     <div
       style={{
         minHeight: "100vh",
-        background: "#0a0a0a",
+        background: "var(--app-bg-deep)",
         padding: "48px 40px",
       }}
     >

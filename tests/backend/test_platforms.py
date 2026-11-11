@@ -7,7 +7,10 @@ def test_platform_registry_marks_xhs_enabled_and_others_coming_soon():
 
     assert by_id[PlatformId.XHS].enabled is True
     assert by_id[PlatformId.XHS].accent_color == "#ff2442"
-    assert by_id[PlatformId.DOUYIN].enabled is False
+    # CLN-2（P2-13）：抖音已有完整路由与前端 Shell，注册表如实标记 enabled，
+    # 消除 /api/platforms、应用中心、路由三者的矛盾
+    assert by_id[PlatformId.DOUYIN].enabled is True
+    assert by_id[PlatformId.DOUYIN].status == "enabled"
     assert by_id[PlatformId.KUAISHOU].status == "coming_soon"
     assert set(by_id) == {
         PlatformId.XHS,

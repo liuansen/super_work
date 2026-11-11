@@ -12,7 +12,7 @@ from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.core.time import shanghai_now
 from backend.app.models import KeywordGroup, Note, PlatformAccount, User
-from backend.app.schemas.common import paginated
+from backend.app.schemas.common import paginate_query, paginated
 
 router = APIRouter(prefix="/keyword-groups", tags=["keyword-groups"])
 
@@ -96,8 +96,10 @@ def _note_metrics(note: Note) -> dict[str, int]:
 
 
 def _note_haystack(note: Note) -> str:
-    raw_text = json.dumps(note.raw_json or {}, ensure_ascii=False)
-    return "\n".join([note.note_id, note.title, note.content, note.author_name, raw_text]).lower()
+    # 统一实现见 services/note_search：读取写入时算好的 search_text
+    from backend.app.services.note_search import note_haystack
+
+    return note_haystack(note)
 
 
 def _owned_notes(db: Session, current_user: User, platform: str) -> list[Note]:
@@ -110,14 +112,19 @@ def _owned_notes(db: Session, current_user: User, platform: str) -> list[Note]:
 
 def _trend_summary(db: Session, current_user: User, group: KeywordGroup) -> dict[str, Any]:
     notes = _owned_notes(db, current_user, group.platform)
+    # 每条笔记的 haystack（含 raw_json 全文）只构建一次，
+    # 避免「关键词 × 笔记」双重循环里反复 json.dumps 整份上游响应
+    haystacks = {note.id: _note_haystack(note) for note in notes}
     keyword_items: list[dict[str, Any]] = []
     matched_by_note_id: dict[int, dict[str, Any]] = {}
     for keyword in group.keywords or []:
         needle = keyword.lower()
-        matched_notes = [note for note in notes if needle in _note_haystack(note)]
+        matched_notes = [note for note in notes if needle in haystacks.get(note.id, "")]
         engagement = sum(_note_metrics(note)["engagement"] for note in matched_notes)
         keyword_items.append({"keyword": keyword, "notes": len(matched_notes), "engagement": engagement})
         for note in matched_notes:
+            if note.id in matched_by_note_id:
+                continue
             metrics = _note_metrics(note)
             matched_by_note_id[note.id] = {
                 "id": note.id,
@@ -147,8 +154,15 @@ def list_keyword_groups(
     statement = select(KeywordGroup).where(KeywordGroup.user_id == current_user.id)
     if platform:
         statement = statement.where(KeywordGroup.platform == platform)
-    groups = db.scalars(statement.order_by(KeywordGroup.created_at.desc(), KeywordGroup.id.desc())).all()
-    return paginated([_serialize_group(group) for group in groups], page, page_size)
+    # PERF-2：SQL 侧分页
+    return paginate_query(
+        db,
+        statement,
+        page=page,
+        page_size=page_size,
+        serializer=_serialize_group,
+        order_by=(KeywordGroup.created_at.desc(), KeywordGroup.id.desc()),
+    )
 
 
 @router.post("")

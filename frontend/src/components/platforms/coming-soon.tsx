@@ -18,7 +18,7 @@ export function ComingSoonPage() {
         alignItems: "center",
         justifyContent: "center",
         minHeight: "100vh",
-        background: "#0a0a0a",
+        background: "var(--app-bg-deep)",
       }}
     >
       <Result

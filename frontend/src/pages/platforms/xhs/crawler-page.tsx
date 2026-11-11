@@ -14,8 +14,9 @@ import type { ColumnsType } from "antd/es/table";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
-import { crawlXhsDataStream, fetchAccounts } from "../../../lib/api";
-import type { PlatformAccount, XhsDataCrawlItem, XhsDataCrawlMode } from "../../../types";
+import { crawlXhsDataStream } from "../../../lib/api";
+import { useAccounts } from "../../../hooks/use-accounts";
+import type { XhsDataCrawlItem, XhsDataCrawlMode } from "../../../types";
 
 const { Title, Text } = Typography;
 
@@ -161,7 +162,7 @@ function exportRowsToExcel(items: XhsDataCrawlItem[]) {
 }
 
 export function XhsCrawlerPage() {
-  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const { accounts, isLoading: isLoadingAccounts, refresh: refreshAccounts } = useAccounts("xhs");
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [mode, setMode] = useState<XhsDataCrawlMode>("note_urls");
   const [urls, setUrls] = useState("");
@@ -175,7 +176,6 @@ export function XhsCrawlerPage() {
   const [successCount, setSuccessCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [progressMsg, setProgressMsg] = useState<string | null>(null);
-  const [isLoadingAccounts, setIsLoadingAccounts] = useState(true);
   const [isRunning, setIsRunning] = useState(false);
   const runAbortRef = useRef<AbortController | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -183,15 +183,10 @@ export function XhsCrawlerPage() {
   const pcAccounts = useMemo(() => accounts.filter((a) => a.platform === "xhs" && a.sub_type === "pc"), [accounts]);
 
   async function loadAccounts() {
-    setIsLoadingAccounts(true);
     setError(null);
-    try {
-      const loaded = await fetchAccounts("xhs");
-      setAccounts(loaded);
-      const first = loaded.find((a) => a.sub_type === "pc");
-      setSelectedAccountId((c) => c ?? first?.id ?? null);
-    } catch { setError("账号列表加载失败。"); }
-    finally { setIsLoadingAccounts(false); }
+    const result = await refreshAccounts();
+    const first = (result.data ?? []).find((a) => a.sub_type === "pc");
+    setSelectedAccountId((c) => c ?? first?.id ?? null);
   }
 
   async function handleRun(e?: FormEvent) {
@@ -210,7 +205,7 @@ export function XhsCrawlerPage() {
     runAbortRef.current = controller;
     try {
       const summary = await crawlXhsDataStream(
-        { account_id: selectedAccountId, mode, urls: parsedUrls, keyword: keyword.trim(), pages, max_notes: maxNotes, time_sleep: timeSleep, fetch_comments: mode === "comments" ? false : fetchCommentsChecked, ...filters, geo: filters.geo.trim() },
+        { account_id: selectedAccountId, mode, urls: parsedUrls, keyword: keyword.trim(), pages, max_notes: maxNotes, time_sleep: timeSleep, fetch_comments: mode === "comments" ? false : fetchCommentsChecked, save_to_library: true, ...filters, geo: filters.geo.trim() },
         (index, item) => { setItems((prev) => [...prev, item]); },
         (msg) => { setProgressMsg(msg); },
         (msg) => { setError(msg); },
@@ -264,7 +259,7 @@ export function XhsCrawlerPage() {
           <Text type="secondary">搜索结果、笔记详情和评论抓取，失败项单独标注并可导出 Excel</Text>
         </Col>
         <Col>
-          <Button icon={<ReloadOutlined />} onClick={loadAccounts} loading={isLoadingAccounts}>刷新账号</Button>
+          <Button icon={<ReloadOutlined />} onClick={() => void loadAccounts()} loading={isLoadingAccounts}>刷新账号</Button>
         </Col>
       </Row>
 

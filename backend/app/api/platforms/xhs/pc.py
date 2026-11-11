@@ -14,6 +14,14 @@ from backend.app.core.database import get_db
 from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.models import AccountCookieVersion, PlatformAccount, User
+from backend.app.services.xhs_normalizers import (
+    all_urls as _all_urls,
+    first_url as _first_url,
+    metric as _metric,
+    note_url as _note_url,
+    normalize_search_item as _normalize_search_item,
+    tag_names as _tag_names,
+)
 
 router = APIRouter(prefix="/xhs/pc", tags=["xhs-pc"])
 
@@ -52,103 +60,6 @@ def _cookies_to_string(value: str) -> str:
         cookies = json.loads(stripped)
         return "; ".join(f"{key}={cookie_value}" for key, cookie_value in cookies.items())
     return stripped
-
-
-def _metric(value: Any) -> int:
-    if value is None:
-        return 0
-    if isinstance(value, (int, float)):
-        return int(value)
-    text = str(value).strip().replace(",", "")
-    if not text:
-        return 0
-    multiplier = 1
-    if text.endswith("万"):
-        multiplier = 10000
-        text = text[:-1]
-    elif text.lower().endswith("w"):
-        multiplier = 10000
-        text = text[:-1]
-    number_match = re.search(r"\d+(?:\.\d+)?", text)
-    if not number_match:
-        return 0
-    return int(float(number_match.group(0)) * multiplier)
-
-
-def _first_url(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list) and value:
-        return _first_url(value[0])
-    if isinstance(value, dict):
-        info_list = value.get("info_list")
-        if isinstance(info_list, list) and len(info_list) > 1 and isinstance(info_list[1], dict):
-            preferred_url = info_list[1].get("url")
-            if preferred_url:
-                return str(preferred_url)
-        for key in ("url_default", "url_pre", "url", "src"):
-            if value.get(key):
-                return str(value[key])
-        for nested in ("info_list", "image_list", "images"):
-            if value.get(nested):
-                return _first_url(value[nested])
-    return ""
-
-
-def _all_urls(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value] if value else []
-    if isinstance(value, list):
-        urls: list[str] = []
-        for item in value:
-            urls.extend(_all_urls(item))
-        return [url for index, url in enumerate(urls) if url and url not in urls[:index]]
-    if isinstance(value, dict):
-        direct = _first_url(value)
-        if direct:
-            return [direct]
-        urls: list[str] = []
-        for nested in ("info_list", "image_list", "images"):
-            if value.get(nested):
-                urls.extend(_all_urls(value[nested]))
-        return [url for index, url in enumerate(urls) if url and url not in urls[:index]]
-    return []
-
-
-def _tag_names(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    tags: list[str] = []
-    for item in value:
-        if isinstance(item, str):
-            tag = item
-        elif isinstance(item, dict):
-            tag = item.get("name") or item.get("tag_name") or item.get("title") or ""
-        else:
-            tag = ""
-        if tag and tag not in tags:
-            tags.append(str(tag))
-    return tags
-
-
-def _note_url(note_id: str, item: dict[str, Any], card: dict[str, Any]) -> str:
-    xsec_token = card.get("xsec_token") or item.get("xsec_token") or ""
-    if note_id and xsec_token:
-        xsec_source = card.get("xsec_source") or item.get("xsec_source") or "pc_feed"
-        return f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={xsec_token}&xsec_source={xsec_source}"
-    for value in (
-        card.get("note_url"),
-        card.get("url"),
-        card.get("share_url"),
-        item.get("note_url"),
-        item.get("url"),
-        item.get("share_url"),
-    ):
-        if isinstance(value, str) and value:
-            return value
-    if not note_id:
-        return ""
-    return f"https://www.xiaohongshu.com/explore/{note_id}"
 
 
 def _comment_id(comment: dict[str, Any]) -> str:
@@ -214,32 +125,6 @@ def _extract_comment_list(raw_payload: Any) -> list[dict[str, Any]]:
 
 def normalize_comment_payload(raw_payload: Any) -> list[dict[str, Any]]:
     return _flatten_comments(_extract_comment_list(raw_payload))
-
-
-def _normalize_search_item(item: dict[str, Any]) -> dict[str, Any]:
-    card = item.get("note_card") or item.get("note") or item
-    author = card.get("user") or card.get("author") or {}
-    interact = card.get("interact_info") or card.get("interaction") or {}
-    note_id = card.get("note_id") or card.get("id") or item.get("id") or ""
-    timestamp = card.get("time") or card.get("create_time") or item.get("time") or item.get("create_time") or 0
-    return {
-        "note_id": note_id,
-        "note_url": _note_url(str(note_id), item, card),
-        "title": card.get("display_title") or card.get("title") or "",
-        "content": card.get("desc") or card.get("content") or "",
-        "author_id": author.get("user_id") or author.get("id") or "",
-        "author_name": author.get("nickname") or author.get("name") or "",
-        "author_avatar": author.get("avatar") or author.get("avatar_url") or "",
-        "cover_url": _first_url(card.get("cover") or card.get("image_list") or card.get("images")),
-        "image_urls": _all_urls(card.get("image_list") or card.get("images") or card.get("cover")),
-        "likes": _metric(interact.get("liked_count") or interact.get("likes")),
-        "collects": _metric(interact.get("collected_count") or interact.get("collects")),
-        "comments": _metric(interact.get("comment_count") or interact.get("comments")),
-        "shares": _metric(interact.get("share_count") or interact.get("shares")),
-        "type": card.get("type") or item.get("model_type") or "",
-        "timestamp": timestamp,
-        "raw": item,
-    }
 
 
 def _video_url(card: dict[str, Any]) -> str:

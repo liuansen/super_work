@@ -21,9 +21,21 @@ database:
   mysql_database: "spider_xhs"
 
 security:
-  # MUST be overridden via SECRET_KEY env var
-  secret_key: "CHANGE_ME_VIA_ENV_VAR"
+  # MUST be overridden via SECRET_KEY env var. Literal placeholders are
+  # intentionally NOT provided: a guessable key equals publishing the JWT
+  # signing secret. Startup is rejected when SECRET_KEY is empty/placeholder.
+  secret_key: ""
   fernet_key: ""
+
+rate_limit:
+  # 多 worker / 多副本部署必须设置 Redis，否则限流按进程独立计数（阈值被放大 N 倍）
+  redis_url: ""
+  crawl_per_minute: 5
+
+backup:
+  enabled: true
+  dir: "./data/backups"
+  keep: 7
 
 scheduler:
   enabled: true

@@ -5,7 +5,7 @@ python-dotenv
 retry
 openpyxl
 aiohttp
-opencv-python
+opencv-python-headless
 numpy
 qrcode
 fastapi
@@ -17,11 +17,10 @@ pydantic-settings
 cryptography
 python-multipart
 apscheduler
-pytest
-httpx
-passlib[bcrypt]
-python-jose[cryptography]
+# 可选：设置 REDIS_URL 后限流改为多进程共享（否则回退进程内存）
+redis>=5.0
 Pillow>=9.2
 pyyaml
+PyMySQL
 
 curl_cffi
