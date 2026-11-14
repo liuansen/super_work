@@ -64,6 +64,25 @@ def _parse_schedule_time(value: str | None) -> tuple[int, int] | None:
         return None
     return int(match.group(1)), int(match.group(2))
 
+# review P1：schedule_time 之前只校验长度，写进 "abcde" 会让 _calculate_next_run_at
+# 抛 ValueError；调度器吞掉异常后 next_run_at 滞留在过去，于是每分钟重复发布一次。
+_SCHEDULE_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _normalize_schedule_time(value: str) -> str:
+    text = (value or "").strip()
+    if not _SCHEDULE_TIME_RE.match(text):
+        raise ValueError("schedule_time 必须为 HH:MM（24 小时制，例如 09:30）")
+    return text
+
+
+def _parse_schedule_time(value: str | None) -> tuple[int, int] | None:
+    """解析 HH:MM；非法值返回 None（调用方据此停止排期，不再让异常逃逸）。"""
+    match = _SCHEDULE_TIME_RE.match((value or "").strip())
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
 
 class AutoTaskCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=128)

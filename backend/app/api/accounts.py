@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,11 +12,11 @@ from backend.app.adapters.xhs.creator_login_adapter import XhsCreatorLoginAdapte
 from backend.app.adapters.xhs.pc_api_adapter import XhsPcApiAdapter
 from backend.app.adapters.xhs.pc_login_adapter import XhsPcLoginAdapter
 from backend.app.core.database import get_db
-from backend.app.core.deps import app_access_required, get_current_user
+from backend.app.core.deps import get_current_user
 from backend.app.core.security import decrypt_text
 from backend.app.core.time import shanghai_now
 from backend.app.models import AccountCookieVersion, PlatformAccount, User
-from backend.app.schemas.common import paginate_query, paginated
+from backend.app.schemas.common import paginated
 from backend.app.services.account_service import (
     account_profile_from_user_info,
     cookie_header_from_text,
@@ -28,13 +27,7 @@ from backend.app.services.account_service import (
 )
 from xhs_utils.cookie_util import trans_cookies
 
-logger = logging.getLogger(__name__)
-
-router = APIRouter(
-    prefix="/accounts",
-    tags=["accounts"],
-    dependencies=[Depends(app_access_required("xhs"))],
-)
+router = APIRouter(prefix="/accounts", tags=["accounts"])
 
 
 class CookieImportRequest(BaseModel):
@@ -101,14 +94,11 @@ def get_accounts(
     statement = select(PlatformAccount).where(PlatformAccount.user_id == current_user.id)
     if platform:
         statement = statement.where(PlatformAccount.platform == platform)
-    # PERF-2：SQL 侧分页（此前全量加载后在内存切片）
-    return paginate_query(
-        db,
-        statement,
-        page=page,
-        page_size=page_size,
-        serializer=serialize_account,
-        order_by=(PlatformAccount.created_at.desc(), PlatformAccount.id.desc()),
+    accounts = db.scalars(statement.order_by(PlatformAccount.created_at.desc())).all()
+    return paginated(
+        [serialize_account(account) for account in accounts],
+        page,
+        page_size,
     )
 
 
@@ -207,14 +197,11 @@ def check_account(
                     account.status = "expired"
                     account.status_message = f"上传凭证获取失败: {msg}"
             except Exception as upload_exc:
-                # 上游异常可能含 URL/Cookie 片段：日志记原文，返回给前端时截断
-                logger.warning("Creator 上传凭证校验异常: account=%s", account.id, exc_info=True)
                 account.status = "expired"
-                account.status_message = f"上传凭证验证异常: {str(upload_exc)[:200]}"
+                account.status_message = f"上传凭证验证异常: {upload_exc}"
     except Exception as exc:
-        logger.warning("账号状态刷新失败: account=%s", account.id, exc_info=True)
         account.status = "expired"
-        account.status_message = str(exc)[:200]
+        account.status_message = str(exc)
         account.updated_at = shanghai_now()
 
     db.commit()
@@ -232,48 +219,13 @@ def delete_account(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from backend.app.models import AutoTask, MonitoringTarget, Note, PublishJob
-
     account = db.get(PlatformAccount, account_id)
     if account is None or account.user_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
-
-    # DB-1（P1-2）：显式清理关联行，不依赖数据库级联作为唯一保障
-    # （外键 PRAGMA foreign_keys=ON 下悬挂引用会直接 IntegrityError）
-    referencing_auto_tasks = db.scalar(
-        select(AutoTask.id)
-        .where((AutoTask.pc_account_id == account.id) | (AutoTask.creator_account_id == account.id))
-        .limit(1)
-    )
-    if referencing_auto_tasks is not None:
-        # 自动运营强依赖账号（pc/creator 两个字段非空），先删任务再删账号
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="该账号被自动运营任务引用，请先删除或修改对应的自动运营任务",
-        )
-
-    # Cookie 版本：级联删除
     for cookie_version in db.scalars(
         select(AccountCookieVersion).where(AccountCookieVersion.platform_account_id == account.id)
     ).all():
         db.delete(cookie_version)
-
-    # 已采集笔记保留（W0-3 决策）：账号引用置空
-    for note in db.scalars(select(Note).where(Note.platform_account_id == account.id)).all():
-        note.platform_account_id = None
-
-    # 发布任务保留但解绑（执行时账号校验会给出可读失败）
-    for job in db.scalars(select(PublishJob).where(PublishJob.platform_account_id == account.id)).all():
-        job.platform_account_id = None
-
-    # 监控目标解绑
-    for target in db.scalars(
-        select(MonitoringTarget).where(MonitoringTarget.platform_account_id == account.id)
-    ).all():
-        target.platform_account_id = None
-
-    # 草稿（ai_drafts）不直接引用账号，无需处理
-
     db.delete(account)
     db.commit()
     return {"id": account_id, "status": "deleted"}

@@ -26,7 +26,6 @@ import { useEffect, useState } from "react";
 import { AddAccountDrawer } from "../../../components/account/add-account-drawer";
 import { checkAccount, deleteAccount } from "../../../lib/api";
 import { accountsQueryKey, useAccounts, useQueryClient } from "../../../hooks/use-accounts";
-import { useAuth } from "../../../hooks/use-auth";
 import { formatShanghaiTime } from "../../../lib/time";
 import type { PlatformAccount } from "../../../types";
 
@@ -62,14 +61,13 @@ export function XhsAccountsPage() {
   // 账号列表走共享缓存（useAccounts）：与其他页面共用同一份数据
   const { accounts, isLoading, error: accountsError, refresh: loadAccounts } = useAccounts("xhs");
   const queryClient = useQueryClient();
-  const auth = useAuth();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [checkingAccountIds, setCheckingAccountIds] = useState<Set<number>>(() => new Set());
   const [error, setError] = useState<string | null>(null);
 
   /** 就地替换缓存中的单个账号（健康检查返回最新状态）。 */
   function replaceCachedAccount(updated: PlatformAccount) {
-    queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs", auth.user?.id), (current) =>
+    queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs"), (current) =>
       (current ?? []).map((account) => (account.id === updated.id ? updated : account))
     );
   }
@@ -105,7 +103,7 @@ export function XhsAccountsPage() {
         setError(null);
         try {
           await deleteAccount(account.id);
-          queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs", auth.user?.id), (current) =>
+          queryClient.setQueryData<PlatformAccount[]>(accountsQueryKey("xhs"), (current) =>
             (current ?? []).filter((item) => item.id !== account.id)
           );
         } catch {
